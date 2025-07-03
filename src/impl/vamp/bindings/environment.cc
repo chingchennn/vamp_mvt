@@ -2,6 +2,7 @@
 
 #include <vamp/collision/filter.hh>
 #include <vamp/collision/capt.hh>
+#include <vamp/collision/mvt.hh>
 #include <vamp/collision/factory.hh>
 #include <vamp/collision/shapes.hh>
 
@@ -148,7 +149,7 @@ void vamp::binding::init_environment(nanobind::module_ &pymodule)
             [](vc::Environment<float> &e, const vc::HeightField<float> &s)
             { e.heightfields.emplace_back(s); })
         .def(
-            "add_pointcloud",
+            "add_capt_pointcloud",
             [](vc::Environment<float> &e,
                const std::vector<collision::Point> &pc,
                float r_min,
@@ -156,7 +157,21 @@ void vamp::binding::init_environment(nanobind::module_ &pymodule)
                float r_point)
             {
                 auto start_time = std::chrono::steady_clock::now();
-                e.pointclouds.emplace_back(pc, r_min, r_max, r_point);
+                e.capt_pointclouds.emplace_back(pc, r_min, r_max, r_point);
+                return vamp::utils::get_elapsed_nanoseconds(start_time);
+            })
+        .def(
+            "add_mvt_pointcloud",
+            [](vc::Environment<float> &e,
+                const std::vector<collision::Point> &pc,
+                float r_min,
+                float r_max,
+                collision::Point &workspace_aabb_min,
+                collision::Point &workspace_aabb_max,
+                float r_point)
+            {
+                auto start_time = std::chrono::steady_clock::now();
+                e.mvt_pointclouds.emplace_back(pc, r_min, r_max, workspace_aabb_min, workspace_aabb_max, r_point);
                 return vamp::utils::get_elapsed_nanoseconds(start_time);
             })
         .def(

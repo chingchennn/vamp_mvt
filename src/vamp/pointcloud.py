@@ -130,11 +130,16 @@ def problem_dict_to_pointcloud(
         robot: str,
         r_min: float,
         r_max: float,
+        pointcloud_repr: str,
         problem: Dict[str, List[Dict[str, Union[float, NDArray[np.float32]]]]],
         samples_per_object: int,
         filter_radius: float,
         filter_cull: bool
     ):
+
+    if pointcloud_repr not in ["capt", "mvt"]:
+        raise ValueError("pc_repr must be one of: 'capt', 'mvt'")
+
     original_pointcloud = problem_to_pointcloud(problem, samples_per_object).tolist()
 
     filter_origin = [0.0, 0.0, 0.0]
@@ -162,6 +167,10 @@ def problem_dict_to_pointcloud(
     )
 
     env = Environment()
-    build_time = env.add_pointcloud(filtered_pc, r_min, r_max, POINT_RADIUS)
+
+    if pointcloud_repr == "capt":
+        build_time = env.add_capt_pointcloud(filtered_pc, r_min, r_max, POINT_RADIUS)
+    else:
+        build_time = env.add_mvt_pointcloud(filtered_pc, r_min, r_max, bbox_lo, bbox_hi, POINT_RADIUS)
 
     return env, original_pointcloud, filtered_pc, filter_time, build_time
