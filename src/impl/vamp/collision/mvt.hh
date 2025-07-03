@@ -80,23 +80,32 @@ namespace vamp::collision
         // Three-level voxel table
         struct ZLevelTable {
             std::vector<Voxel> voxels;
-            std::vector<uint8_t> z_coord_to_voxel_idx;
+            uint8_t* z_coord_to_voxel_idx = nullptr;
             
-            ZLevelTable() : z_coord_to_voxel_idx(256, INVALID_INDEX) {}
+            void initialize_with_pool(uint8_t* idx_ptr) {
+                z_coord_to_voxel_idx = idx_ptr;
+                std::fill(z_coord_to_voxel_idx, z_coord_to_voxel_idx + 256, INVALID_INDEX);
+            }
         };
         
         struct YLevelTable {
             std::vector<ZLevelTable> z_tables;
-            std::vector<uint8_t> y_coord_to_z_table_idx;
+            uint8_t* y_coord_to_z_table_idx = nullptr;
             
-            YLevelTable() : y_coord_to_z_table_idx(256, INVALID_INDEX) {}
+            void initialize_with_pool(uint8_t* idx_ptr) {
+                y_coord_to_z_table_idx = idx_ptr;
+                std::fill(y_coord_to_z_table_idx, y_coord_to_z_table_idx + 256, INVALID_INDEX);
+            }
         };
 
         struct XLevelTable {
             std::vector<YLevelTable> y_tables;
-            std::vector<uint8_t> x_coord_to_y_table_idx;
+            uint8_t* x_coord_to_y_table_idx = nullptr;
             
-            XLevelTable() : x_coord_to_y_table_idx(256, INVALID_INDEX) {}
+            void initialize_with_pool(uint8_t* idx_ptr) {
+                x_coord_to_y_table_idx = idx_ptr;
+                std::fill(x_coord_to_y_table_idx, x_coord_to_y_table_idx + 256, INVALID_INDEX);
+            }
         };
 
         // Member variables
@@ -104,6 +113,10 @@ namespace vamp::collision
         size_t point_coord_pool_size = 0;
         size_t point_coord_pool_used = 0;
         size_t max_point_per_voxel = 0;
+
+        std::unique_ptr<uint8_t[], decltype(&std::free)> index_pool{nullptr, &std::free};
+        size_t index_pool_size = 0;
+        size_t index_pool_used = 0;
 
         XLevelTable x_level_table;
         
@@ -178,8 +191,10 @@ namespace vamp::collision
             inverse_scale_factor(other.inverse_scale_factor),
             max_point_per_voxel(other.max_point_per_voxel),
             point_coord_pool_size(other.point_coord_pool_size),
-            point_coord_pool_used(other.point_coord_pool_used)
-        {
+            point_coord_pool_used(other.point_coord_pool_used),
+            index_pool_size(other.index_pool_size),
+            index_pool_used(other.index_pool_used) 
+        {   
             copy_memory_pool(other);
  
             x_level_table = other.x_level_table;
@@ -330,6 +345,7 @@ namespace vamp::collision
             const auto grid_x_array = grid_center_x.to_array();
             const auto grid_y_array = grid_center_y.to_array();
             const auto grid_z_array = grid_center_z.to_array();
+
             
             for (size_t i = 0; i < SIMD_WIDTH; ++i) {
                 // Skip spheres that are completely outside global AABB
@@ -715,9 +731,9 @@ namespace vamp::collision
     private:
         void initialize_memory_pool() {
             const float workspace_width = workspace_aabb_max[0] - workspace_aabb_min[0];
-            const int max_points_per_dim = static_cast<int>(
-                                           std::ceil(workspace_width / (point_radius * 2)) * 0.1);
-            point_coord_pool_size = max_points_per_dim * max_points_per_dim * max_points_per_dim * 3;
+            const int estimated_points_per_dim = static_cast<int>(
+                                                 std::ceil(workspace_width / (point_radius * 2)) * 0.1);
+            point_coord_pool_size = estimated_points_per_dim * estimated_points_per_dim * estimated_points_per_dim * 3;
             
             void* raw_ptr = nullptr;
             if (posix_memalign(&raw_ptr, 32, point_coord_pool_size * sizeof(float)) != 0) {
@@ -725,6 +741,15 @@ namespace vamp::collision
             }
             // std::cout << "Num float in pool: " << point_coord_pool_size << std::endl;
             point_coord_pool.reset(static_cast<float*>(raw_ptr));
+
+            const int estimated_tables = 1 + Y_TABLE_CAPACITY + Y_TABLE_CAPACITY * Z_TABLE_CAPACITY_PER_Y;
+            index_pool_size = estimated_tables * 256;  // 256 entries per table
+            
+            void* idx_raw_ptr = nullptr;
+            if (posix_memalign(&idx_raw_ptr, 64, index_pool_size * sizeof(uint8_t)) != 0) {
+                throw std::runtime_error("Failed to allocate aligned index pool");
+            }
+            index_pool.reset(static_cast<uint8_t*>(idx_raw_ptr));
         }
 
         void build_spatial_grid(const std::vector<Point>& points) {
@@ -738,6 +763,7 @@ namespace vamp::collision
                                                  std::ceil(max_query_radius / (point_radius * 2)) * 0.3);
             max_point_per_voxel = max_point_per_voxel_dim * max_point_per_voxel_dim * max_point_per_voxel_dim;
             // std::cout << "Num point per voxel: " << max_point_per_voxel << std::endl;
+            x_level_table.initialize_with_pool(allocate_index_array());
             x_level_table.y_tables.reserve(Y_TABLE_CAPACITY);
             
             for (const auto& point : points) {
@@ -789,6 +815,7 @@ namespace vamp::collision
         }
 
         void copy_memory_pool(const MVT& other) {
+            // Copy point coordinate pool
             if (other.point_coord_pool && other.point_coord_pool_size > 0) {
                 void* raw_ptr = nullptr;
                 if (posix_memalign(&raw_ptr, 32, point_coord_pool_size * sizeof(float)) != 0) {
@@ -799,15 +826,40 @@ namespace vamp::collision
                 std::memcpy(point_coord_pool.get(), other.point_coord_pool.get(), 
                 point_coord_pool_used * sizeof(float));
             }
+
+            // Copy index pool
+            if (other.index_pool && other.index_pool_size > 0) {
+                void* idx_raw_ptr = nullptr;
+                if (posix_memalign(&idx_raw_ptr, 64, index_pool_size * sizeof(uint8_t)) != 0) {
+                    throw std::runtime_error("Failed to allocate aligned index pool");
+                }
+                index_pool.reset(static_cast<uint8_t*>(idx_raw_ptr));
+                std::memcpy(index_pool.get(), other.index_pool.get(), 
+                            index_pool_used * sizeof(uint8_t));
+            }
         }
 
         void update_voxel_pointers_after_copy(const MVT& other) {
             // Calculate offset between old and new pools
             const ptrdiff_t pool_offset = point_coord_pool.get() - other.point_coord_pool.get();
+            const ptrdiff_t index_offset = index_pool.get() - other.index_pool.get();
+
+            // Update root table index pointer
+            if (x_level_table.x_coord_to_y_table_idx) {
+                x_level_table.x_coord_to_y_table_idx += index_offset;
+            }
             
             // Update all voxel pointers
             for (auto& y_table : x_level_table.y_tables) {
+                if (y_table.y_coord_to_z_table_idx) {
+                    y_table.y_coord_to_z_table_idx += index_offset;
+                }
+
                 for (auto& z_table : y_table.z_tables) {
+                    if (z_table.z_coord_to_voxel_idx) {
+                        z_table.z_coord_to_voxel_idx += index_offset;
+                    }
+
                     for (auto& voxel : z_table.voxels) {
                         if (voxel.x_coords) {
                             voxel.x_coords += pool_offset;
@@ -826,8 +878,9 @@ namespace vamp::collision
                 y_level_index = static_cast<uint8_t>(x_level_table.y_tables.size());
                 x_level_table.x_coord_to_y_table_idx[voxel_x] = y_level_index;
                 x_level_table.y_tables.emplace_back();
-                
-                // Reserve Y-level storage
+
+                // Initialize Y-level table with pool
+                x_level_table.y_tables.back().initialize_with_pool(allocate_index_array());
                 x_level_table.y_tables.back().z_tables.reserve(Z_TABLE_CAPACITY_PER_Y);
             }
             
@@ -840,7 +893,8 @@ namespace vamp::collision
                 y_level_table.y_coord_to_z_table_idx[voxel_y] = z_level_index;
                 y_level_table.z_tables.emplace_back();
 
-                // Reserve Z-level storage
+                // Initialize Z-level table with pool
+                y_level_table.z_tables.back().initialize_with_pool(allocate_index_array());
                 y_level_table.z_tables.back().voxels.reserve(VOXEL_CAPACITY_PER_Z);
             }
             
@@ -869,7 +923,8 @@ namespace vamp::collision
         float* allocate_coords(size_t count) {
             // Align count to SIMD boundary
             constexpr size_t SIMD_WIDTH = FVectorT::num_scalars;
-            size_t aligned_count = ((count + SIMD_WIDTH - 1) / SIMD_WIDTH) * SIMD_WIDTH;
+            constexpr size_t SIMD_MASK = ~(SIMD_WIDTH - 1);
+            const size_t aligned_count = (count + SIMD_WIDTH - 1) & SIMD_MASK;
             
             if (point_coord_pool_used + aligned_count > point_coord_pool_size) {
                 throw std::runtime_error("Pont coordinate pool exhausted");
@@ -879,6 +934,17 @@ namespace vamp::collision
             std::fill(result, result + aligned_count, 0.0f);
 
             point_coord_pool_used += aligned_count;
+            return result;
+        }
+
+        uint8_t* allocate_index_array() {
+            if (index_pool_used + 256 > index_pool_size) {
+                throw std::runtime_error("Index pool exhausted");
+            }
+            
+            uint8_t* result = index_pool.get() + index_pool_used;
+            index_pool_used += 256;
+
             return result;
         }
     };
