@@ -30,8 +30,9 @@ namespace vamp::collision
         static constexpr uint8_t Y_TABLE_CAPACITY = 32;
         static constexpr uint8_t Z_TABLE_CAPACITY_PER_Y = 32;
         static constexpr uint8_t VOXEL_CAPACITY_PER_Z = 32;
-        
-        struct Voxel {
+        static constexpr uint8_t INDEX_ARRAY_LEN = 64;
+
+        struct alignas(64) Voxel {
             // Structure-of-Arrays for SIMD efficiency
             float* x_coords = nullptr;
             float* y_coords = nullptr;
@@ -84,7 +85,7 @@ namespace vamp::collision
             
             void initialize_with_pool(uint8_t* idx_ptr) {
                 z_coord_to_voxel_idx = idx_ptr;
-                std::fill(z_coord_to_voxel_idx, z_coord_to_voxel_idx + 256, INVALID_INDEX);
+                std::fill(z_coord_to_voxel_idx, z_coord_to_voxel_idx + INDEX_ARRAY_LEN, INVALID_INDEX);
             }
         };
         
@@ -94,7 +95,7 @@ namespace vamp::collision
             
             void initialize_with_pool(uint8_t* idx_ptr) {
                 y_coord_to_z_table_idx = idx_ptr;
-                std::fill(y_coord_to_z_table_idx, y_coord_to_z_table_idx + 256, INVALID_INDEX);
+                std::fill(y_coord_to_z_table_idx, y_coord_to_z_table_idx + INDEX_ARRAY_LEN, INVALID_INDEX);
             }
         };
 
@@ -104,7 +105,7 @@ namespace vamp::collision
             
             void initialize_with_pool(uint8_t* idx_ptr) {
                 x_coord_to_y_table_idx = idx_ptr;
-                std::fill(x_coord_to_y_table_idx, x_coord_to_y_table_idx + 256, INVALID_INDEX);
+                std::fill(x_coord_to_y_table_idx, x_coord_to_y_table_idx + INDEX_ARRAY_LEN, INVALID_INDEX);
             }
         };
 
@@ -112,7 +113,7 @@ namespace vamp::collision
         std::unique_ptr<float[], decltype(&std::free)> point_coord_pool{nullptr, &std::free};
         size_t point_coord_pool_size = 0;
         size_t point_coord_pool_used = 0;
-        size_t max_point_per_voxel = 0;
+        size_t estimated_max_point_per_voxel = 0;
 
         std::unique_ptr<uint8_t[], decltype(&std::free)> index_pool{nullptr, &std::free};
         size_t index_pool_size = 0;
@@ -189,7 +190,7 @@ namespace vamp::collision
             global_aabb_min(other.global_aabb_min),
             global_aabb_max(other.global_aabb_max),
             inverse_scale_factor(other.inverse_scale_factor),
-            max_point_per_voxel(other.max_point_per_voxel),
+            estimated_max_point_per_voxel(other.estimated_max_point_per_voxel),
             point_coord_pool_size(other.point_coord_pool_size),
             point_coord_pool_used(other.point_coord_pool_used),
             index_pool_size(other.index_pool_size),
@@ -233,19 +234,27 @@ namespace vamp::collision
 
             const float query_radius_squared = query_radius * query_radius;
                 
-            // Option 1: Check 26 surrounding voxels
-            // Map center to grid coordinates
-            const int grid_center_x = static_cast<int>((center[0] - workspace_aabb_min[0]) * inverse_scale_factor);
-            const int grid_center_y = static_cast<int>((center[1] - workspace_aabb_min[1]) * inverse_scale_factor);
-            const int grid_center_z = static_cast<int>((center[2] - workspace_aabb_min[2]) * inverse_scale_factor);
+            const float grid_query_radius = query_radius * inverse_scale_factor;
+            const float grid_center_x_float = (center[0] - workspace_aabb_min[0]) * inverse_scale_factor;
+            const float grid_center_y_float = (center[1] - workspace_aabb_min[1]) * inverse_scale_factor;
+            const float grid_center_z_float = (center[2] - workspace_aabb_min[2]) * inverse_scale_factor;
             
-            // Determine the bounds of voxels to check
-            const int min_x = std::max(0, grid_center_x - 1);
-            const int max_x = std::min(255, grid_center_x + 1);
-            const int min_y = std::max(0, grid_center_y - 1);
-            const int max_y = std::min(255, grid_center_y + 1);
-            const int min_z = std::max(0, grid_center_z - 1);
-            const int max_z = std::min(255, grid_center_z + 1);
+            // Calculate actual sphere bounds in grid space
+            const int min_x_touched = static_cast<int>(grid_center_x_float - grid_query_radius);
+            const int max_x_touched = static_cast<int>(grid_center_x_float + grid_query_radius);
+            const int min_y_touched = static_cast<int>(grid_center_y_float - grid_query_radius);
+            const int max_y_touched = static_cast<int>(grid_center_y_float + grid_query_radius);
+            const int min_z_touched = static_cast<int>(grid_center_z_float - grid_query_radius);
+            const int max_z_touched = static_cast<int>(grid_center_z_float + grid_query_radius);
+
+            // Determine voxel bounds to check (at most 26-neighborhood)
+            const int min_x = std::max({0, min_x_touched, static_cast<int>(grid_center_x_float) - 1});
+            const int max_x = std::min({254, max_x_touched, static_cast<int>(grid_center_x_float) + 1});
+            const int min_y = std::max({0, min_y_touched, static_cast<int>(grid_center_y_float) - 1});
+            const int max_y = std::min({254, max_y_touched, static_cast<int>(grid_center_y_float) + 1});
+            const int min_z = std::max({0, min_z_touched, static_cast<int>(grid_center_z_float) - 1});
+            const int max_z = std::min({254, max_z_touched, static_cast<int>(grid_center_z_float) + 1});
+
 
             // Iterate through potentially overlapping voxels
             for (int voxel_x = min_x; voxel_x <= max_x; ++voxel_x) {
@@ -303,7 +312,7 @@ namespace vamp::collision
         // Parameters:
         // - centers: (x, y, z) struct-of-arrays of the centers of each sphere
         // - radii: SIMD vector of the radii of each sphere
-        auto collides_simd(const std::array<FVectorT, 3> &centers, 
+        auto inline collides_simd(const std::array<FVectorT, 3> &centers, 
                           FVectorT radii) const noexcept -> bool
         {
             constexpr size_t SIMD_WIDTH = FVectorT::num_scalars;
@@ -331,21 +340,23 @@ namespace vamp::collision
             const FVectorT inv_scale = FVectorT::fill(inverse_scale_factor);
             
             // Convert centers to grid coordinates (vectorized)
-            const auto grid_center_x = ((centers[0] - simd_workspace_min_x) * inv_scale).floor();
-            const auto grid_center_y = ((centers[1] - simd_workspace_min_y) * inv_scale).floor();
-            const auto grid_center_z = ((centers[2] - simd_workspace_min_z) * inv_scale).floor();
+            const FVectorT grid_center_x = ((centers[0] - simd_workspace_min_x) * inv_scale);
+            const FVectorT grid_center_y = ((centers[1] - simd_workspace_min_y) * inv_scale);
+            const FVectorT grid_center_z = ((centers[2] - simd_workspace_min_z) * inv_scale);
+
+            const auto query_radii_squared = query_radii * query_radii;
 
             // For each sphere that's not completely outside, do detailed collision check
             // Extract individual spheres for detailed checking
             const auto centers_x_array = centers[0].to_array();
             const auto centers_y_array = centers[1].to_array();
             const auto centers_z_array = centers[2].to_array();
-            const auto radii_array = radii.to_array();
+            const auto query_radii_array = query_radii.to_array();
+            const auto query_radii_squared_array = query_radii_squared.to_array();
             const auto outside_array = outside_mask.to_array();
             const auto grid_x_array = grid_center_x.to_array();
             const auto grid_y_array = grid_center_y.to_array();
             const auto grid_z_array = grid_center_z.to_array();
-
             
             for (size_t i = 0; i < SIMD_WIDTH; ++i) {
                 // Skip spheres that are completely outside global AABB
@@ -354,22 +365,30 @@ namespace vamp::collision
                 }
                 
                 const Point center = {centers_x_array[i], centers_y_array[i], centers_z_array[i]};
-                const float radius = radii_array[i];
-                const float query_radius = radius + point_radius;
-                const float query_radius_squared = query_radius * query_radius;
+                const float query_radius = query_radii_array[i];
+                const float query_radius_squared = query_radii_squared_array[i];
+                const float grid_query_radius = query_radii_array[i] * inverse_scale_factor;
+
+                const float grid_center_x_float = grid_x_array[i];
+                const float grid_center_y_float = grid_y_array[i];
+                const float grid_center_z_float = grid_z_array[i];
                 
-                const int grid_center_x_int = static_cast<int>(grid_x_array[i]);
-                const int grid_center_y_int = static_cast<int>(grid_y_array[i]);
-                const int grid_center_z_int = static_cast<int>(grid_z_array[i]);
-                
-                // Determine voxel bounds to check (26-neighborhood)
-                const int min_x = std::max(0, grid_center_x_int - 1);
-                const int max_x = std::min(254, grid_center_x_int + 1);
-                const int min_y = std::max(0, grid_center_y_int - 1);
-                const int max_y = std::min(254, grid_center_y_int + 1);
-                const int min_z = std::max(0, grid_center_z_int - 1);
-                const int max_z = std::min(254, grid_center_z_int + 1);
-                
+                // Calculate actual sphere bounds in grid space
+                const int min_x_touched = static_cast<int>(grid_center_x_float - grid_query_radius);
+                const int max_x_touched = static_cast<int>(grid_center_x_float + grid_query_radius);
+                const int min_y_touched = static_cast<int>(grid_center_y_float - grid_query_radius);
+                const int max_y_touched = static_cast<int>(grid_center_y_float + grid_query_radius);
+                const int min_z_touched = static_cast<int>(grid_center_z_float - grid_query_radius);
+                const int max_z_touched = static_cast<int>(grid_center_z_float + grid_query_radius);
+
+                // Determine voxel bounds to check
+                const int min_x = std::max({0, min_x_touched, static_cast<int>(grid_center_x_float) - 1});
+                const int max_x = std::min({254, max_x_touched, static_cast<int>(grid_center_x_float) + 1});
+                const int min_y = std::max({0, min_y_touched, static_cast<int>(grid_center_y_float) - 1});
+                const int max_y = std::min({254, max_y_touched, static_cast<int>(grid_center_y_float) + 1});
+                const int min_z = std::max({0, min_z_touched, static_cast<int>(grid_center_z_float) - 1});
+                const int max_z = std::min({254, max_z_touched, static_cast<int>(grid_center_z_float) + 1});
+
                 // Check voxels in the neighborhood
                 for (int voxel_x = min_x; voxel_x <= max_x; ++voxel_x) {
                     const uint8_t y_level_index = x_level_table.x_coord_to_y_table_idx[voxel_x];
@@ -399,12 +418,12 @@ namespace vamp::collision
                                 continue;
                             }
                             
-                            // SIMD point-by-point collision check within this voxel
                             const size_t num_points = voxel.point_count;
                             const auto* x_coords = voxel.x_coords;
                             const auto* y_coords = voxel.y_coords;
                             const auto* z_coords = voxel.z_coords;
 
+                            // Option1 : Always do SIMD point-by-point collision check within this voxel
                             // Broadcast sphere center and radius for SIMD comparison
                             const FVectorT sphere_x = FVectorT::fill(center[0]);
                             const FVectorT sphere_y = FVectorT::fill(center[1]);
@@ -413,7 +432,6 @@ namespace vamp::collision
 
                             // Process points in SIMD chunks
                             size_t point_idx = 0;
-                            // const size_t num_points_aligned = ((voxel.point_count + SIMD_WIDTH - 1) / SIMD_WIDTH) * SIMD_WIDTH;
                             constexpr size_t SIMD_MASK = ~(SIMD_WIDTH - 1);
                             const size_t num_points_aligned = (num_points + SIMD_WIDTH - 1) & SIMD_MASK;
 
@@ -437,18 +455,106 @@ namespace vamp::collision
                                 }
                             }
 
-                            // Handle remaining points
-                            for (; point_idx < num_points; ++point_idx) {
-                                // std::cout << "Shouldn't have remaining points";
-                                const float dx = center[0] - x_coords[point_idx];
-                                const float dy = center[1] - y_coords[point_idx];
-                                const float dz = center[2] - z_coords[point_idx];
-                                const float distance_squared = dx * dx + dy * dy + dz * dz;
+                            // // Option 2: Hybrid
+                            // // Hot path: optimize for voxels with few points (median is 3)
+                            // if (num_points <= 4) {
+                            //     // Scalar code with manual unrolling
+                            //     const float cx = center[0];
+                            //     const float cy = center[1];
+                            //     const float cz = center[2];
                                 
-                                if (distance_squared <= query_radius_squared) {
-                                    return true; // Collision detected
-                                }
-                            }
+                            //     // Fully unrolled for common cases
+                            //     switch (num_points) {
+                            //         case 1: {
+                            //             const float dx = cx - x_coords[0];
+                            //             const float dy = cy - y_coords[0];
+                            //             const float dz = cz - z_coords[0];
+                            //             if (dx*dx + dy*dy + dz*dz <= query_radius_squared) return true;
+                            //             break;
+                            //         }
+                            //         case 2: {
+                            //             const float dx0 = cx - x_coords[0];
+                            //             const float dy0 = cy - y_coords[0];
+                            //             const float dz0 = cz - z_coords[0];
+                            //             if (dx0*dx0 + dy0*dy0 + dz0*dz0 <= query_radius_squared) return true;
+                                        
+                            //             const float dx1 = cx - x_coords[1];
+                            //             const float dy1 = cy - y_coords[1];
+                            //             const float dz1 = cz - z_coords[1];
+                            //             if (dx1*dx1 + dy1*dy1 + dz1*dz1 <= query_radius_squared) return true;
+                            //             break;
+                            //         }
+                            //         case 3: {
+                            //             const float dx0 = cx - x_coords[0];
+                            //             const float dy0 = cy - y_coords[0];
+                            //             const float dz0 = cz - z_coords[0];
+                            //             if (dx0*dx0 + dy0*dy0 + dz0*dz0 <= query_radius_squared) return true;
+                                        
+                            //             const float dx1 = cx - x_coords[1];
+                            //             const float dy1 = cy - y_coords[1];
+                            //             const float dz1 = cz - z_coords[1];
+                            //             if (dx1*dx1 + dy1*dy1 + dz1*dz1 <= query_radius_squared) return true;
+                                        
+                            //             const float dx2 = cx - x_coords[2];
+                            //             const float dy2 = cy - y_coords[2];
+                            //             const float dz2 = cz - z_coords[2];
+                            //             if (dx2*dx2 + dy2*dy2 + dz2*dz2 <= query_radius_squared) return true;
+                            //             break;
+                            //         }
+                            //         case 4: {
+                            //             // Process 4 points
+                            //             for (size_t i = 0; i < 4; ++i) {
+                            //                 const float dx = cx - x_coords[i];
+                            //                 const float dy = cy - y_coords[i];
+                            //                 const float dz = cz - z_coords[i];
+                            //                 if (dx*dx + dy*dy + dz*dz <= query_radius_squared) return true;
+                            //             }
+                            //             break;
+                            //         }
+                            //     }
+                            // } else {
+                            //     // Use SIMD for larger voxels (5+ points)
+                            //     const FVectorT sphere_x = FVectorT::fill(center[0]);
+                            //     const FVectorT sphere_y = FVectorT::fill(center[1]);
+                            //     const FVectorT sphere_z = FVectorT::fill(center[2]);
+                            //     const FVectorT sphere_radius_sq = FVectorT::fill(query_radius_squared);
+
+                            //     size_t point_idx = 0;
+                            //     constexpr size_t SIMD_MASK = ~(SIMD_WIDTH - 1);
+                            //     const size_t num_points_aligned = (num_points + SIMD_WIDTH - 1) & SIMD_MASK;
+
+                            //     for (; point_idx < num_points_aligned; point_idx += SIMD_WIDTH) {
+                            //         const FVectorT point_x(x_coords + point_idx);
+                            //         const FVectorT point_y(y_coords + point_idx);
+                            //         const FVectorT point_z(z_coords + point_idx);
+                                    
+                            //         const FVectorT dx = sphere_x - point_x;
+                            //         const FVectorT dy = sphere_y - point_y;
+                            //         const FVectorT dz = sphere_z - point_z;
+                            //         const FVectorT dist_sq = dx * dx + dy * dy + dz * dz;
+                                    
+                            //         const auto collision_mask = dist_sq <= sphere_radius_sq;
+                            //         if (collision_mask.any()) {
+                            //             return true;
+                            //         }
+                            //     }
+                            // }
+
+                            // // Option 3: Do serial collision checking
+                            // size_t point_idx = 0; 
+                            // for (; point_idx < num_points; ++point_idx) {
+                            //     const float dx = center[0] - x_coords[point_idx];
+                            //     const float dy = center[1] - y_coords[point_idx];
+                            //     const float dz = center[2] - z_coords[point_idx];
+                            //     // const float distance_squared = dx * dx + dy * dy + dz * dz;
+                                
+                            //     float distance_squared = dx * dx;
+                            //     distance_squared = std::fma(dy, dy, distance_squared);
+                            //     distance_squared = std::fma(dz, dz, distance_squared);
+                            //     if (distance_squared <= query_radius_squared) {
+                            //         return true; // Collision detected
+                            //     }
+                            // }
                         }
                     }
                 }
@@ -500,19 +606,19 @@ namespace vamp::collision
             std::vector<size_t> points_per_voxel;
             
             // Traverse the three-level structure
-            for (size_t x = 0; x < 256; ++x) {
+            for (size_t x = 0; x < INDEX_ARRAY_LEN; ++x) {
                 if (x_level_table.x_coord_to_y_table_idx[x] != INVALID_INDEX) {
                     non_empty_x_entries++;
                     uint8_t y_level_idx = x_level_table.x_coord_to_y_table_idx[x];
                     const auto& y_level = x_level_table.y_tables[y_level_idx];
                     
-                    for (size_t y = 0; y < 256; ++y) {
+                    for (size_t y = 0; y < INDEX_ARRAY_LEN; ++y) {
                         if (y_level.y_coord_to_z_table_idx[y] != INVALID_INDEX) {
                             non_empty_y_entries++;
                             uint8_t z_level_idx = y_level.y_coord_to_z_table_idx[y];
                             const auto& z_level = y_level.z_tables[z_level_idx];
                             
-                            for (size_t z = 0; z < 256; ++z) {
+                            for (size_t z = 0; z < INDEX_ARRAY_LEN; ++z) {
                                 if (z_level.z_coord_to_voxel_idx[z] != INVALID_INDEX) {
                                     non_empty_z_entries++;
                                     uint8_t voxel_idx = z_level.z_coord_to_voxel_idx[z];
@@ -532,7 +638,7 @@ namespace vamp::collision
             os << "=== Grid Statistics ===" << std::endl;
             os << "Total points stored: " << total_points << std::endl;
             os << "Total voxels: " << total_voxels << std::endl;
-            os << "Non-empty X entries: " << non_empty_x_entries << " / 256" << std::endl;
+            os << "Non-empty X entries: " << non_empty_x_entries << " / " << INDEX_ARRAY_LEN << std::endl;
             os << "Non-empty Y entries: " << non_empty_y_entries << " (total across all X)" << std::endl;
             os << "Non-empty Z entries: " << non_empty_z_entries << " (total across all Y)" << std::endl;
             
@@ -562,10 +668,10 @@ namespace vamp::collision
             os << "Calculation breakdown:" << std::endl;
             os << "  Root table struct: " << sizeof(XLevelTable) << " bytes" << std::endl;
 
-            // Memory for root hash table's lookup array (always 256 entries)
-            size_t root_lookup_array = 256 * sizeof(uint8_t);
+            // Memory for root hash table's lookup array (always INDEX_ARRAY_LEN entries)
+            size_t root_lookup_array = INDEX_ARRAY_LEN * sizeof(uint8_t);
             x_level_table_memory += root_lookup_array;
-            os << "  Root lookup array (256 * " << sizeof(uint8_t) << "): " << root_lookup_array << " bytes" << std::endl;
+            os << "  Root lookup array (" << INDEX_ARRAY_LEN << " * " << sizeof(uint8_t) << "): " << root_lookup_array << " bytes" << std::endl;
 
             // Memory for Y-level tables vector in root
             size_t root_y_vector = x_level_table.y_tables.capacity() * sizeof(YLevelTable);
@@ -580,7 +686,7 @@ namespace vamp::collision
             size_t total_coordinate_capacity = 0;
 
             // Traverse the three-level structure to calculate actual memory usage
-            for (size_t x = 0; x < 256; ++x) {
+            for (size_t x = 0; x < INDEX_ARRAY_LEN; ++x) {
                 if (x_level_table.x_coord_to_y_table_idx[x] != INVALID_INDEX) {
                     uint8_t y_level_idx = x_level_table.x_coord_to_y_table_idx[x];
                     const auto& y_level = x_level_table.y_tables[y_level_idx];
@@ -588,10 +694,10 @@ namespace vamp::collision
                     // Memory for this Y-level table
                     y_table_count++;
                     y_tables_memory += sizeof(YLevelTable);
-                    y_tables_memory += 256 * sizeof(uint8_t); // y_coord_to_z_table_idx array
+                    y_tables_memory += INDEX_ARRAY_LEN * sizeof(uint8_t); // y_coord_to_z_table_idx array
                     y_tables_memory += y_level.z_tables.capacity() * sizeof(ZLevelTable);
                     
-                    for (size_t y = 0; y < 256; ++y) {
+                    for (size_t y = 0; y < INDEX_ARRAY_LEN; ++y) {
                         if (y_level.y_coord_to_z_table_idx[y] != INVALID_INDEX) {
                             uint8_t z_level_idx = y_level.y_coord_to_z_table_idx[y];
                             const auto& z_level = y_level.z_tables[z_level_idx];
@@ -599,10 +705,10 @@ namespace vamp::collision
                             // Memory for this Z-level table
                             z_table_count++;
                             z_tables_memory += sizeof(ZLevelTable);
-                            z_tables_memory += 256 * sizeof(uint8_t); // z_coord_to_voxel_idx array
+                            z_tables_memory += INDEX_ARRAY_LEN * sizeof(uint8_t); // z_coord_to_voxel_idx array
                             z_tables_memory += z_level.voxels.capacity() * sizeof(Voxel);
                             
-                            for (size_t z = 0; z < 256; ++z) {
+                            for (size_t z = 0; z < INDEX_ARRAY_LEN; ++z) {
                                 if (z_level.z_coord_to_voxel_idx[z] != INVALID_INDEX) {
                                     uint8_t voxel_idx = z_level.z_coord_to_voxel_idx[z];
                                     const auto& voxel = z_level.voxels[voxel_idx];
@@ -627,14 +733,14 @@ namespace vamp::collision
             os << "  Y-level tables (" << y_table_count << " tables):" << std::endl;
             os << "    - Structs: " << y_table_count << " * " << sizeof(YLevelTable) 
             << " = " << y_table_count * sizeof(YLevelTable) << " bytes" << std::endl;
-            os << "    - Lookup arrays: " << y_table_count << " * 256 * " << sizeof(uint8_t)
-            << " = " << y_table_count * 256 * sizeof(uint8_t) << " bytes" << std::endl;
+            os << "    - Lookup arrays: " << y_table_count << " * " << INDEX_ARRAY_LEN << " * " << sizeof(uint8_t)
+            << " = " << y_table_count * INDEX_ARRAY_LEN * sizeof(uint8_t) << " bytes" << std::endl;
 
             os << "  Z-level tables (" << z_table_count << " tables):" << std::endl;
             os << "    - Structs: " << z_table_count << " * " << sizeof(ZLevelTable)
             << " = " << z_table_count * sizeof(ZLevelTable) << " bytes" << std::endl;
-            os << "    - Lookup arrays: " << z_table_count << " * 256 * " << sizeof(uint8_t)
-            << " = " << z_table_count * 256 * sizeof(uint8_t) << " bytes" << std::endl;
+            os << "    - Lookup arrays: " << z_table_count << " * " << INDEX_ARRAY_LEN << " * " << sizeof(uint8_t)
+            << " = " << z_table_count * INDEX_ARRAY_LEN * sizeof(uint8_t) << " bytes" << std::endl;
 
             os << "  Voxels (" << voxel_count << " voxels):" << std::endl;
             os << "    - Structs + bounding boxes: " << voxel_count << " * (" 
@@ -681,19 +787,19 @@ namespace vamp::collision
                << y_start << "-" << y_end << ", "
                << z_start << "-" << z_end << "] ===" << std::endl;
             
-            for (int x = x_start; x <= x_end && x < 256; ++x) {
+            for (int x = x_start; x <= x_end && x < INDEX_ARRAY_LEN; ++x) {
                 if (x_level_table.x_coord_to_y_table_idx[x] == INVALID_INDEX) continue;
                 
                 uint8_t y_level_idx = x_level_table.x_coord_to_y_table_idx[x];
                 const auto& y_level = x_level_table.y_tables[y_level_idx];
                 
-                for (int y = y_start; y <= y_end && y < 256; ++y) {
+                for (int y = y_start; y <= y_end && y < INDEX_ARRAY_LEN; ++y) {
                     if (y_level.y_coord_to_z_table_idx[y] == INVALID_INDEX) continue;
                     
                     uint8_t z_level_idx = y_level.y_coord_to_z_table_idx[y];
                     const auto& z_level = y_level.z_tables[z_level_idx];
                     
-                    for (int z = z_start; z <= z_end && z < 256; ++z) {
+                    for (int z = z_start; z <= z_end && z < INDEX_ARRAY_LEN; ++z) {
                         if (z_level.z_coord_to_voxel_idx[z] == INVALID_INDEX) continue;
                         
                         uint8_t voxel_idx = z_level.z_coord_to_voxel_idx[z];
@@ -743,7 +849,7 @@ namespace vamp::collision
             point_coord_pool.reset(static_cast<float*>(raw_ptr));
 
             const int estimated_tables = 1 + Y_TABLE_CAPACITY + Y_TABLE_CAPACITY * Z_TABLE_CAPACITY_PER_Y;
-            index_pool_size = estimated_tables * 256;  // 256 entries per table
+            index_pool_size = estimated_tables * INDEX_ARRAY_LEN;  // INDEX_ARRAY_LEN entries per table
             
             void* idx_raw_ptr = nullptr;
             if (posix_memalign(&idx_raw_ptr, 64, index_pool_size * sizeof(uint8_t)) != 0) {
@@ -755,14 +861,15 @@ namespace vamp::collision
         void build_spatial_grid(const std::vector<Point>& points) {
             const float workspace_width = workspace_aabb_max[0] - workspace_aabb_min[0];
             const int grid_width = std::min(static_cast<int>(MAX_GRID_SIZE), 
-                                            static_cast<int>(std::ceil(workspace_width / max_query_radius)));
+                                            static_cast<int>(std::ceil(workspace_width / (max_query_radius))));
             
             inverse_scale_factor = grid_width / workspace_width;
             
-            const int max_point_per_voxel_dim = static_cast<int>(
-                                                 std::ceil(max_query_radius / (point_radius * 2)) * 0.3);
-            max_point_per_voxel = max_point_per_voxel_dim * max_point_per_voxel_dim * max_point_per_voxel_dim;
-            // std::cout << "Num point per voxel: " << max_point_per_voxel << std::endl;
+            const int estimated_max_point_per_voxel_dim = static_cast<int>(
+                                                 std::ceil((max_query_radius) / (point_radius * 2) * 0.25));
+            estimated_max_point_per_voxel = estimated_max_point_per_voxel_dim * estimated_max_point_per_voxel_dim * estimated_max_point_per_voxel_dim;
+            // std::cout << "Num point per voxel: " << estimated_max_point_per_voxel << std::endl;
+           
             x_level_table.initialize_with_pool(allocate_index_array());
             x_level_table.y_tables.reserve(Y_TABLE_CAPACITY);
             
@@ -911,10 +1018,10 @@ namespace vamp::collision
                 // z_level_table.voxels.back().reserve(RESERVED_POINT_CAPACITY_PER_VOXEL);
                         
                 // Allocate space from pool
-                float* x_ptr = allocate_coords(max_point_per_voxel);
-                float* y_ptr = allocate_coords(max_point_per_voxel);
-                float* z_ptr = allocate_coords(max_point_per_voxel);
-                z_level_table.voxels.back().initialize_with_pool(x_ptr, y_ptr, z_ptr, max_point_per_voxel);
+                float* x_ptr = allocate_coords(estimated_max_point_per_voxel);
+                float* y_ptr = allocate_coords(estimated_max_point_per_voxel);
+                float* z_ptr = allocate_coords(estimated_max_point_per_voxel);
+                z_level_table.voxels.back().initialize_with_pool(x_ptr, y_ptr, z_ptr, estimated_max_point_per_voxel);
             }
             
             z_level_table.voxels[voxel_index].add_point(point);
@@ -925,9 +1032,8 @@ namespace vamp::collision
             constexpr size_t SIMD_WIDTH = FVectorT::num_scalars;
             constexpr size_t SIMD_MASK = ~(SIMD_WIDTH - 1);
             const size_t aligned_count = (count + SIMD_WIDTH - 1) & SIMD_MASK;
-            
             if (point_coord_pool_used + aligned_count > point_coord_pool_size) {
-                throw std::runtime_error("Pont coordinate pool exhausted");
+                throw std::runtime_error("Point coordinate pool exhausted");
             }
             
             float* result = point_coord_pool.get() + point_coord_pool_used;
@@ -938,12 +1044,12 @@ namespace vamp::collision
         }
 
         uint8_t* allocate_index_array() {
-            if (index_pool_used + 256 > index_pool_size) {
+            if (index_pool_used + INDEX_ARRAY_LEN > index_pool_size) {
                 throw std::runtime_error("Index pool exhausted");
             }
             
             uint8_t* result = index_pool.get() + index_pool_used;
-            index_pool_used += 256;
+            index_pool_used += INDEX_ARRAY_LEN;
 
             return result;
         }
