@@ -1,4 +1,5 @@
 #include <vamp/collision/filter.hh>
+#include <vamp/collision/filter_centervox.hh>
 #include <vamp/collision/capt.hh>
 #include <vamp/collision/mvt.hh>
 #include <vamp/collision/factory.hh>
@@ -185,11 +186,23 @@ void vamp::binding::init_environment(nanobind::module_ &pymodule)
            const collision::Point &origin,
            const collision::Point &workcell_min,
            const collision::Point &workcell_max,
-           bool cull) -> std::pair<std::vector<collision::Point>, std::size_t>
+           bool cull, 
+           std::string filter_type) -> std::pair<std::vector<collision::Point>, std::size_t>
         {
-            auto start_time = std::chrono::steady_clock::now();
-            auto filtered =
-                vc::filter_pointcloud(pc, min_dist, max_range, origin, workcell_min, workcell_max, cull);
+            std::chrono::time_point<std::chrono::steady_clock> start_time;
+            std::vector<collision::Point> filtered;
+            
+            if (filter_type == "scdf") 
+            {
+                start_time = std::chrono::steady_clock::now();
+                filtered = vc::filter_pointcloud(pc, min_dist, max_range, origin, workcell_min, workcell_max, cull);
+            } 
+            else if (filter_type == "centervox") 
+            {
+                start_time = std::chrono::steady_clock::now();
+                filtered = vc::filter_pointcloud_centervox(pc, min_dist, max_range, origin, workcell_min, workcell_max, cull);
+            }
+
             return {filtered, vamp::utils::get_elapsed_nanoseconds(start_time)};
         });
 
@@ -201,11 +214,23 @@ void vamp::binding::init_environment(nanobind::module_ &pymodule)
            const collision::Point &origin,
            const collision::Point &workcell_min,
            const collision::Point &workcell_max,
-           bool cull) -> std::pair<std::vector<collision::Point>, std::size_t>
+           bool cull, 
+           std::string filter_type) -> std::pair<std::vector<collision::Point>, std::size_t>
         {
-            auto start_time = std::chrono::steady_clock::now();
-            auto filtered =
-                vc::filter_pointcloud(pc, min_dist, max_range, origin, workcell_min, workcell_max, cull);
+            std::chrono::time_point<std::chrono::steady_clock> start_time;
+            std::vector<collision::Point> filtered;
+            
+            if (filter_type == "scdf") 
+            {
+                start_time = std::chrono::steady_clock::now();
+                filtered = vc::filter_pointcloud(pc, min_dist, max_range, origin, workcell_min, workcell_max, cull);
+            } 
+            else if (filter_type == "centervox") 
+            {
+                start_time = std::chrono::steady_clock::now();
+                filtered = vc::filter_pointcloud_centervox(pc, min_dist, max_range, origin, workcell_min, workcell_max, cull);
+            }
+
             return {filtered, vamp::utils::get_elapsed_nanoseconds(start_time)};
         });
 

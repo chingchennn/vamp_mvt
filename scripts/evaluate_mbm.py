@@ -23,6 +23,7 @@ def main(
     pointcloud: bool = False,              # Use pointcloud rather than primitive geometry
     pc_repr: str = None,                   # Pointcloud representation, required if pointcloud=True
     samples_per_object: int = 10000,       # If pointcloud, samples per object to use
+    filter_type: str = "scdf",             # Filter type for pointcloud filtering
     filter_radius: float = 0.02,           # Filter radius for pointcloud filtering
     filter_cull: bool = True,              # Cull pointcloud around robot by maximum distance
     **kwargs,
@@ -37,6 +38,11 @@ def main(
         else:
             if pc_repr not in ["capt", "mvt"]:
                 raise ValueError("pc_repr must be one of: 'capt', 'mvt'")
+
+    if filter_type not in ["scdf", "centervox"]:
+                    raise ValueError("filter_type must be one of: 'scdf', 'centervox'\n\t" \
+                                     "scdf: Space-filling Curve Distance Filter\n\t" \
+                                     "centervox: Center-Selective Voxel Filter")
 
     problems_dir = Path(__file__).parent.parent / 'resources' / robot / 'problems'
     with open(problems_dir.parent / dataset, 'rb') as f:
@@ -88,6 +94,7 @@ def main(
                     pc_repr,
                     data,
                     samples_per_object,
+                    filter_type,
                     filter_radius,
                     filter_cull,
                     )
@@ -176,6 +183,7 @@ def main(
     if pointcloud:
         if pc_repr == "capt":
             pointcloud_stats = df[[
+                "filtered_pointcloud_size",
                 "filter_time",
                 "capt_build_time",
                 "total_build_and_plan_time",
@@ -183,6 +191,7 @@ def main(
             pointcloud_stats.drop(index = ["count"], inplace = True)
         else:
             pointcloud_stats = df[[
+                "filtered_pointcloud_size",
                 "filter_time",
                 "mvt_build_time",
                 "total_build_and_plan_time",
@@ -219,8 +228,9 @@ def main(
                 tabulate(
                     pointcloud_stats,
                     headers = [
-                        '  Filter Time (ms)',
-                        '    CAPT Build Time (ms)',
+                        '    Filter PC Size',
+                        '        Filter Time (ms)',
+                        'CAPT Build (ms)',
                         'Total Time (ms)',
                         ],
                     tablefmt = 'github'
@@ -231,8 +241,9 @@ def main(
                 tabulate(
                     pointcloud_stats,
                     headers = [
-                        '  Filter Time (ms)',
-                        '     MVT Build Time (ms)',
+                        '    Filter PC Size',
+                        '        Filter Time (ms)',
+                        ' MVT Build (ms)',
                         'Total Time (ms)',
                         ],
                     tablefmt = 'github'
