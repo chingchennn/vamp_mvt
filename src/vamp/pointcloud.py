@@ -133,12 +133,16 @@ def problem_dict_to_pointcloud(
         pointcloud_repr: str,
         problem: Dict[str, List[Dict[str, Union[float, NDArray[np.float32]]]]],
         samples_per_object: int,
+        filter_type: str,
         filter_radius: float,
         filter_cull: bool
     ):
 
     if pointcloud_repr not in ["capt", "mvt"]:
         raise ValueError("pc_repr must be one of: 'capt', 'mvt'")
+    
+    if filter_type not in ["scdf", "centervox"]:
+        raise ValueError("filter_type must be one of: 'scdf', 'centervox'")
 
     original_pointcloud = problem_to_pointcloud(problem, samples_per_object).tolist()
 
@@ -163,7 +167,8 @@ def problem_dict_to_pointcloud(
         filter_origin,
         bbox_lo,
         bbox_hi,
-        filter_cull
+        filter_cull,
+        filter_type
     )
 
     env = Environment()
