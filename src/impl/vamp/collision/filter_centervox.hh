@@ -12,7 +12,7 @@
 
 namespace vamp::collision
 {
-    struct Voxel {
+    struct alignas(64) Voxel {
         Point stored_point;
         Point voxel_center;
         float stored_point_dist_sq = 0.0f;
@@ -30,7 +30,7 @@ namespace vamp::collision
             const float dy = point[1] - voxel_center[1];
             const float dz = point[2] - voxel_center[2];
             const float new_dist_sq = dx*dx + dy*dy + dz*dz;
-            
+
             if (!occupied) {
                 // First point in this voxel
                 stored_point = point;
@@ -56,7 +56,7 @@ namespace vamp::collision
         static constexpr uint8_t Y_TABLE_CAPACITY = 32;
         static constexpr uint8_t Z_TABLE_CAPACITY_PER_Y = 32;
         static constexpr uint8_t POINT_CAPACITY_PER_Z = 32;
-        static constexpr uint8_t INDEX_ARRAY_LEN = 128;
+        static constexpr uint8_t INDEX_ARRAY_LEN = 255;
 
         struct ZLevelTable {
             std::vector<Voxel> voxels;
@@ -160,13 +160,236 @@ namespace vamp::collision
             return result;
         }
 
+
+        // Visualization helper
+        struct VizStats {
+            uint32_t total_y_tables = 0;
+            uint32_t total_z_tables = 0; 
+            uint32_t total_voxels = 0;
+            uint32_t occupied_voxels = 0;
+            uint32_t max_y_tables_per_x = 0;
+            uint32_t max_z_tables_per_y = 0;
+            uint32_t max_voxels_per_z = 0;
+            float memory_utilization_percent = 0.0f;
+        };
+
+        // Summary visualization - shows structure statistics
+        VizStats visualize_summary() const {
+            VizStats stats;
+            
+            stats.total_y_tables = x_level_table.y_tables.size();
+            
+            for (const auto& y_table : x_level_table.y_tables) {
+                stats.total_z_tables += y_table.z_tables.size();
+                stats.max_z_tables_per_y = std::max(stats.max_z_tables_per_y, 
+                                                static_cast<uint32_t>(y_table.z_tables.size()));
+                
+                for (const auto& z_table : y_table.z_tables) {
+                    stats.total_voxels += z_table.voxels.size();
+                    stats.max_voxels_per_z = std::max(stats.max_voxels_per_z,
+                                                    static_cast<uint32_t>(z_table.voxels.size()));
+                    
+                    for (const auto& voxel : z_table.voxels) {
+                        if (voxel.occupied) {
+                            stats.occupied_voxels++;
+                        }
+                    }
+                }
+            }
+            
+            stats.max_y_tables_per_x = stats.total_y_tables;
+            
+            // Calculate memory utilization vs max possible
+            uint32_t max_possible_voxels = Y_TABLE_CAPACITY * Z_TABLE_CAPACITY_PER_Y * POINT_CAPACITY_PER_Z;
+            stats.memory_utilization_percent = (float(stats.total_voxels) / max_possible_voxels) * 100.0f;
+            
+            printf("=== CenterSelectiveVoxelFilter Summary ===\n");
+            printf("Structure Counts:\n");
+            printf("  Y-tables:      %u\n", stats.total_y_tables);
+            printf("  Z-tables:      %u\n", stats.total_z_tables);
+            printf("  Total voxels:  %u\n", stats.total_voxels);
+            printf("  Occupied:      %u (%.1f%%)\n", stats.occupied_voxels, 
+                stats.total_voxels > 0 ? (float(stats.occupied_voxels) / stats.total_voxels) * 100.0f : 0.0f);
+            
+            printf("\nUtilization:\n");
+            printf("  Max Y/X:       %u\n", stats.max_y_tables_per_x);
+            printf("  Max Z/Y:       %u\n", stats.max_z_tables_per_y);
+            printf("  Max Voxels/Z:  %u\n", stats.max_voxels_per_z);
+            printf("  Memory util:   %.2f%%\n", stats.memory_utilization_percent);
+            
+            printf("\nWorkspace Info:\n");
+            printf("  Min: (%.3f, %.3f, %.3f)\n", workspace_aabb_min[0], workspace_aabb_min[1], workspace_aabb_min[2]);
+            printf("  Max: (%.3f, %.3f, %.3f)\n", workspace_aabb_max[0], workspace_aabb_max[1], workspace_aabb_max[2]);
+            printf("  Voxel size: %.6f\n", voxel_size);
+            printf("  Scale factor: %.6f\n", inverse_scale_factor);
+            printf("  Max range: %.3f\n", std::sqrt(max_range_sq));
+            printf("  Origin: (%.3f, %.3f, %.3f)\n", origin_point[0], origin_point[1], origin_point[2]);
+            
+            return stats;
+        }
+
+        // Detailed visualization - shows all mappings and voxel contents
+        void visualize_detailed(bool show_empty_voxels = false) const {
+            printf("=== Detailed Structure Dump ===\n");
+            
+            // Show X-level mapping
+            printf("\nX-coordinate mappings:\n");
+            for (int x = 0; x < INDEX_ARRAY_LEN; ++x) {
+                uint8_t y_idx = x_level_table.x_coord_to_y_table_idx[x];
+                if (y_idx != INVALID_INDEX) {
+                    printf("  X[%d] -> Y-table[%u] (size: %zu)\n", 
+                        x, y_idx, x_level_table.y_tables[y_idx].z_tables.size());
+                }
+            }
+            
+            // Iterate through structure
+            for (size_t y_table_idx = 0; y_table_idx < x_level_table.y_tables.size(); ++y_table_idx) {
+                const auto& y_table = x_level_table.y_tables[y_table_idx];
+                
+                printf("\n--- Y-table[%zu] ---\n", y_table_idx);
+                
+                // Show Y-level mapping
+                printf("Y-coordinate mappings:\n");
+                for (int y = 0; y < INDEX_ARRAY_LEN; ++y) {
+                    uint8_t z_idx = y_table.y_coord_to_z_table_idx[y];
+                    if (z_idx != INVALID_INDEX) {
+                        printf("  Y[%d] -> Z-table[%u] (size: %zu)\n", 
+                            y, z_idx, y_table.z_tables[z_idx].voxels.size());
+                    }
+                }
+                
+                for (size_t z_table_idx = 0; z_table_idx < y_table.z_tables.size(); ++z_table_idx) {
+                    const auto& z_table = y_table.z_tables[z_table_idx];
+                    
+                    printf("\n  --- Z-table[%zu] ---\n", z_table_idx);
+                    
+                    // Show Z-level mapping  
+                    printf("  Z-coordinate mappings:\n");
+                    for (int z = 0; z < INDEX_ARRAY_LEN; ++z) {
+                        uint8_t voxel_idx = z_table.z_coord_to_voxel_idx[z];
+                        if (voxel_idx != INVALID_INDEX) {
+                            const auto& voxel = z_table.voxels[voxel_idx];
+                            printf("    Z[%d] -> Voxel[%u] %s\n", 
+                                z, voxel_idx, voxel.occupied ? "OCCUPIED" : "empty");
+                        }
+                    }
+                    
+                    // Show voxel details
+                    printf("  Voxels:\n");
+                    for (size_t voxel_idx = 0; voxel_idx < z_table.voxels.size(); ++voxel_idx) {
+                        const auto& voxel = z_table.voxels[voxel_idx];
+                        
+                        if (!voxel.occupied && !show_empty_voxels) continue;
+                        
+                        printf("    [%zu] Center:(%.3f,%.3f,%.3f)", 
+                            voxel_idx, 
+                            voxel.voxel_center[0], voxel.voxel_center[1], voxel.voxel_center[2]);
+                        
+                        if (voxel.occupied) {
+                            printf(" Point:(%.3f,%.3f,%.3f) Dist²:%.6f", 
+                                voxel.stored_point[0], voxel.stored_point[1], voxel.stored_point[2],
+                                voxel.stored_point_dist_sq);
+                        }
+                        printf("\n");
+                    }
+                }
+            }
+        }
+
+        // Verification function - checks internal consistency
+        bool verify_structure_integrity() const {
+            bool is_valid = true;
+            
+            printf("=== Structure Integrity Check ===\n");
+            
+            // Check X-level mappings
+            for (int x = 0; x < INDEX_ARRAY_LEN; ++x) {
+                uint8_t y_idx = x_level_table.x_coord_to_y_table_idx[x];
+                if (y_idx != INVALID_INDEX) {
+                    if (y_idx >= x_level_table.y_tables.size()) {
+                        printf("ERROR: X[%d] maps to invalid Y-table[%u] (size: %zu)\n", 
+                            x, y_idx, x_level_table.y_tables.size());
+                        is_valid = false;
+                    }
+                }
+            }
+            
+            // Check Y and Z level mappings
+            for (size_t y_table_idx = 0; y_table_idx < x_level_table.y_tables.size(); ++y_table_idx) {
+                const auto& y_table = x_level_table.y_tables[y_table_idx];
+                
+                for (int y = 0; y < INDEX_ARRAY_LEN; ++y) {
+                    uint8_t z_idx = y_table.y_coord_to_z_table_idx[y];
+                    if (z_idx != INVALID_INDEX) {
+                        if (z_idx >= y_table.z_tables.size()) {
+                            printf("ERROR: Y-table[%zu] Y[%d] maps to invalid Z-table[%u] (size: %zu)\n", 
+                                y_table_idx, y, z_idx, y_table.z_tables.size());
+                            is_valid = false;
+                        }
+                    }
+                }
+                
+                for (size_t z_table_idx = 0; z_table_idx < y_table.z_tables.size(); ++z_table_idx) {
+                    const auto& z_table = y_table.z_tables[z_table_idx];
+                    
+                    for (int z = 0; z < INDEX_ARRAY_LEN; ++z) {
+                        uint8_t voxel_idx = z_table.z_coord_to_voxel_idx[z];
+                        if (voxel_idx != INVALID_INDEX) {
+                            if (voxel_idx >= z_table.voxels.size()) {
+                                printf("ERROR: Z-table[%zu] Z[%d] maps to invalid voxel[%u] (size: %zu)\n", 
+                                    z_table_idx, z, voxel_idx, z_table.voxels.size());
+                                is_valid = false;
+                            }
+                        }
+                    }
+                }
+            }
+            
+            printf("Structure integrity: %s\n", is_valid ? "VALID" : "INVALID");
+            return is_valid;
+        }
+
+        // Test function to verify point insertion and retrieval
+        void test_point_roundtrip(const std::vector<Point>& test_points) const {
+            printf("=== Point Roundtrip Test ===\n");
+            printf("Testing %zu points...\n", test_points.size());
+            
+            auto extracted = extract_points();
+            printf("Extracted %zu points from filter\n", extracted.size());
+            
+            // Check if all extracted points were in original set
+            size_t found_count = 0;
+            for (const auto& extracted_pt : extracted) {
+                bool found = false;
+                for (const auto& orig_pt : test_points) {
+                    float dx = extracted_pt[0] - orig_pt[0];
+                    float dy = extracted_pt[1] - orig_pt[1]; 
+                    float dz = extracted_pt[2] - orig_pt[2];
+                    float dist_sq = dx*dx + dy*dy + dz*dz;
+                    if (dist_sq < 1e-10f) { // Very small tolerance for float precision
+                        found = true;
+                        found_count++;
+                        break;
+                    }
+                }
+                if (!found) {
+                    printf("ERROR: Extracted point (%.6f,%.6f,%.6f) not found in original set!\n",
+                        extracted_pt[0], extracted_pt[1], extracted_pt[2]);
+                }
+            }
+            
+            printf("Found %zu/%zu extracted points in original set\n", found_count, extracted.size());
+            printf("Compression ratio: %.2f%% (%zu -> %zu points)\n", 
+                test_points.empty() ? 0.0f : (float(extracted.size()) / test_points.size()) * 100.0f,
+                test_points.size(), extracted.size());
+        }
+
     private:
         bool insert_to_voxel(uint8_t voxel_x, uint8_t voxel_y, uint8_t voxel_z, const Point& point) {
             // Level 1: Map X coordinate to Y-level table
             uint8_t y_level_index = x_level_table.x_coord_to_y_table_idx[voxel_x];
             if (y_level_index == INVALID_INDEX) {
                 y_level_index = static_cast<uint8_t>(x_level_table.y_tables.size());
-                if (y_level_index >= Y_TABLE_CAPACITY) return false;
                 
                 x_level_table.x_coord_to_y_table_idx[voxel_x] = y_level_index;
                 x_level_table.y_tables.emplace_back();
@@ -178,7 +401,6 @@ namespace vamp::collision
             uint8_t z_level_index = y_level_table.y_coord_to_z_table_idx[voxel_y];
             if (z_level_index == INVALID_INDEX) {
                 z_level_index = static_cast<uint8_t>(y_level_table.z_tables.size());
-                if (z_level_index >= Z_TABLE_CAPACITY_PER_Y) return false;
                 
                 y_level_table.y_coord_to_z_table_idx[voxel_y] = z_level_index;
                 y_level_table.z_tables.emplace_back();
@@ -190,8 +412,7 @@ namespace vamp::collision
             uint8_t voxel_index = z_level_table.z_coord_to_voxel_idx[voxel_z];
             if (voxel_index == INVALID_INDEX) {
                 voxel_index = static_cast<uint8_t>(z_level_table.voxels.size());
-                if (voxel_index >= POINT_CAPACITY_PER_Z) return false;
-                
+               
                 z_level_table.z_coord_to_voxel_idx[voxel_z] = voxel_index;
                 z_level_table.voxels.emplace_back();
                 
@@ -239,16 +460,23 @@ namespace vamp::collision
         // Create voxel filter with min_dist as voxel size
         CenterSelectiveVoxelFilter filter(min_dist * 1.4, max_range, origin, workspace_min, workspace_max, cull);
         
+        // std::vector<Point> tmp_pc;
+        
         // Insert all points (point closer to voxel center wins for each voxel)
         for (uint32_t i = 0; i < pc.shape(0); ++i) {
             Point point{pc(i, 0), pc(i, 1), pc(i, 2)};
             filter.try_insert_point(point);
+            // tmp_pc.push_back(point);
         }
+    
         
-        // Extract filtered points
-        auto voxel_result = filter.extract_points();
+        // Verify correctness
+        // auto stats = filter.visualize_summary();
+        // filter.verify_structure_integrity();
+        // filter.test_point_roundtrip(tmp_pc);
+        // filter.visualize_detailed(false);
 
-        return voxel_result;
+        return filter.extract_points();
     }
 
     template <>
