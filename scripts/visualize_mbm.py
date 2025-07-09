@@ -19,7 +19,9 @@ def main(
     skip_rng_iterations: int = 0,          # Skip a number of RNG iterations
     display_object_names: bool = False,    # Display object names over geometry
     pointcloud: bool = False,              # Use pointcloud rather than primitive geometry
+    pc_repr: str = None,                   # Pointcloud representation, required if pointcloud=True
     samples_per_object: int = 10000,       # If pointcloud, samples per object to use
+    filter_type: str = "scdf",             # Filter type for pointcloud filtering
     filter_radius: float = 0.02,           # Filter radius for pointcloud filtering
     filter_cull: bool = True,              # Cull pointcloud around robot by maximum distance
     **kwargs,
@@ -27,6 +29,18 @@ def main(
 
     if robot not in vamp.ROBOT_JOINTS:
         raise RuntimeError(f"Robot {robot} does not exist in VAMP!")
+
+    if pointcloud:
+        if not pc_repr:
+            raise ValueError("pc_repr (pointcloud representation) is required when pointcloud=True. Available repr: capt, mvt")
+        else:
+            if pc_repr not in ["capt", "mvt"]:
+                raise ValueError("pc_repr must be one of: 'capt', 'mvt'")
+            
+    if filter_type not in ["scdf", "centervox"]:
+        raise ValueError("filter_type must be one of: 'scdf', 'centervox'\n\t" \
+                            "scdf: Space-filling Curve Distance Filter\n\t" \
+                            "centervox: Center-Selective Voxel Filter")
 
     robot_dir = Path(__file__).parent.parent / 'resources' / robot
     with open(robot_dir / dataset, 'rb') as f:
@@ -56,21 +70,33 @@ Existing problems: {list(data['problems'].keys())}"""
     if pointcloud:
         (env, original_pc, filtered_pc, filter_time, build_time) = vpc.problem_dict_to_pointcloud(
             robot,
+            pc_repr,
             problem_data,
             samples_per_object,
+            filter_type,
             filter_radius,
             filter_cull,
             )
+        if pc_repr == "capt":
+            print(
+                f"""
+    Original Pointcloud size: {len(original_pc)}
+    Filtered Pointcloud size: {len(filtered_pc)}
 
-        print(
-            f"""
-Original Pointcloud size: {len(original_pc)}
-Filtered Pointcloud size: {len(filtered_pc)}
+            Filtering Time: {filter_time * 1e-6:5.3f}ms
+    CAPT Construction Time: {build_time * 1e-6:5.3f}ms
+                """
+                )
+        else:
+            print(
+                f"""
+    Original Pointcloud size: {len(original_pc)}
+    Filtered Pointcloud size: {len(filtered_pc)}
 
-        Filtering Time: {filter_time * 1e-6:5.3f}ms
-CAPT Construction Time: {build_time * 1e-6:5.3f}ms
-            """
-            )
+            Filtering Time: {filter_time * 1e-6:5.3f}ms
+    MVT Construction Time: {build_time * 1e-6:5.3f}ms
+                """
+                )
 
     else:
         env = vamp.problem_dict_to_vamp(problem_data)
