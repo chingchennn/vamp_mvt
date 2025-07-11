@@ -183,6 +183,7 @@ void vamp::binding::init_environment(nanobind::module_ &pymodule)
         [](const std::vector<collision::Point> &pc,
            float min_dist,
            float max_range,
+           float voxel_size,
            const collision::Point &origin,
            const collision::Point &workcell_min,
            const collision::Point &workcell_max,
@@ -200,7 +201,7 @@ void vamp::binding::init_environment(nanobind::module_ &pymodule)
             else if (filter_type == "centervox") 
             {
                 start_time = std::chrono::steady_clock::now();
-                filtered = vc::filter_pointcloud_centervox(pc, min_dist, max_range, origin, workcell_min, workcell_max, cull);
+                filtered = vc::filter_pointcloud_centervox(pc, voxel_size, max_range, origin, workcell_min, workcell_max, cull);
             }
 
             return {filtered, vamp::utils::get_elapsed_nanoseconds(start_time)};
@@ -211,6 +212,7 @@ void vamp::binding::init_environment(nanobind::module_ &pymodule)
         [](const nb::ndarray<float, nb::shape<-1, 3>, nb::device::cpu> &pc,
            float min_dist,
            float max_range,
+           float voxel_size,
            const collision::Point &origin,
            const collision::Point &workcell_min,
            const collision::Point &workcell_max,
@@ -228,7 +230,7 @@ void vamp::binding::init_environment(nanobind::module_ &pymodule)
             else if (filter_type == "centervox") 
             {
                 start_time = std::chrono::steady_clock::now();
-                filtered = vc::filter_pointcloud_centervox(pc, min_dist, max_range, origin, workcell_min, workcell_max, cull);
+                filtered = vc::filter_pointcloud_centervox(pc, voxel_size, max_range, origin, workcell_min, workcell_max, cull);
             }
 
             return {filtered, vamp::utils::get_elapsed_nanoseconds(start_time)};
