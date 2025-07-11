@@ -22,7 +22,8 @@ def main(
     pc_repr: str = None,                   # Pointcloud representation, required if pointcloud=True
     samples_per_object: int = 10000,       # If pointcloud, samples per object to use
     filter_type: str = "scdf",             # Filter type for pointcloud filtering
-    filter_radius: float = 0.02,           # Filter radius for pointcloud filtering
+    filter_radius: float = 0.02,           # Filter radius for pointcloud filtering, required if filter_type="scdf"
+    voxel_filter_size: float = 0.02,       # Voxel filter size for pointcloud filtering, required if filter_type="centervox"
     filter_cull: bool = True,              # Cull pointcloud around robot by maximum distance
     **kwargs,
     ):
@@ -41,7 +42,13 @@ def main(
         raise ValueError("filter_type must be one of: 'scdf', 'centervox'\n\t" \
                             "scdf: Space-filling Curve Distance Filter\n\t" \
                             "centervox: Center-Selective Voxel Filter")
-
+    else:
+        if filter_type == "scdf" and not filter_radius:
+            raise ValueError("filter_radius is required when filter_type=scdf")
+        
+        if filter_type == "centervox" and not voxel_filter_size:
+            raise ValueError("voxel_filter_size is required when filter_type=centervox")
+    
     robot_dir = Path(__file__).parent.parent / 'resources' / robot
     with open(robot_dir / dataset, 'rb') as f:
         data = pickle.load(f)
@@ -78,6 +85,7 @@ Existing problems: {list(data['problems'].keys())}"""
             samples_per_object,
             filter_type,
             filter_radius,
+            voxel_filter_size,
             filter_cull,
             )
         if pc_repr == "capt":
@@ -97,7 +105,7 @@ Existing problems: {list(data['problems'].keys())}"""
     Filtered Pointcloud size: {len(filtered_pc)}
 
             Filtering Time: {filter_time * 1e-6:5.3f}ms
-    MVT Construction Time: {build_time * 1e-6:5.3f}ms
+     MVT Construction Time: {build_time * 1e-6:5.3f}ms
                 """
                 )
 

@@ -135,6 +135,7 @@ def problem_dict_to_pointcloud(
         samples_per_object: int,
         filter_type: str,
         filter_radius: float,
+        voxel_filter_size: float,
         filter_cull: bool
     ):
 
@@ -164,6 +165,7 @@ def problem_dict_to_pointcloud(
         original_pointcloud,
         filter_radius,
         filter_cull_radius,
+        voxel_filter_size,
         filter_origin,
         bbox_lo,
         bbox_hi,
