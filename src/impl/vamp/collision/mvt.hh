@@ -26,11 +26,7 @@ namespace vamp::collision
         
         // Constants
         static constexpr uint8_t INVALID_INDEX = 255;
-        static constexpr uint8_t MAX_GRID_SIZE = 255;
-        static constexpr uint8_t Y_TABLE_CAPACITY = 32;
-        static constexpr uint8_t Z_TABLE_CAPACITY_PER_Y = 32;
-        static constexpr uint8_t VOXEL_CAPACITY_PER_Z = 32;
-        static constexpr uint8_t INDEX_ARRAY_LEN = 64;
+        static constexpr uint8_t MAX_GRID_WIDTH = 255;
 
         struct alignas(64) Voxel {
             // Structure-of-Arrays for SIMD efficiency
@@ -83,9 +79,9 @@ namespace vamp::collision
             std::vector<Voxel> voxels;
             uint8_t* z_coord_to_voxel_idx = nullptr;
             
-            void initialize_with_pool(uint8_t* idx_ptr) {
+            void initialize_with_pool(uint8_t* idx_ptr, uint8_t array_len) {
                 z_coord_to_voxel_idx = idx_ptr;
-                std::fill(z_coord_to_voxel_idx, z_coord_to_voxel_idx + INDEX_ARRAY_LEN, INVALID_INDEX);
+                std::fill(z_coord_to_voxel_idx, z_coord_to_voxel_idx + array_len, INVALID_INDEX);
             }
         };
         
@@ -93,9 +89,9 @@ namespace vamp::collision
             std::vector<ZLevelTable> z_tables;
             uint8_t* y_coord_to_z_table_idx = nullptr;
             
-            void initialize_with_pool(uint8_t* idx_ptr) {
+            void initialize_with_pool(uint8_t* idx_ptr, uint8_t array_len) {
                 y_coord_to_z_table_idx = idx_ptr;
-                std::fill(y_coord_to_z_table_idx, y_coord_to_z_table_idx + INDEX_ARRAY_LEN, INVALID_INDEX);
+                std::fill(y_coord_to_z_table_idx, y_coord_to_z_table_idx + array_len, INVALID_INDEX);
             }
         };
 
@@ -103,13 +99,26 @@ namespace vamp::collision
             std::vector<YLevelTable> y_tables;
             uint8_t* x_coord_to_y_table_idx = nullptr;
             
-            void initialize_with_pool(uint8_t* idx_ptr) {
+            void initialize_with_pool(uint8_t* idx_ptr,uint8_t array_len) {
                 x_coord_to_y_table_idx = idx_ptr;
-                std::fill(x_coord_to_y_table_idx, x_coord_to_y_table_idx + INDEX_ARRAY_LEN, INVALID_INDEX);
+                std::fill(x_coord_to_y_table_idx, x_coord_to_y_table_idx + array_len, INVALID_INDEX);
             }
         };
 
         // Member variables
+        float min_query_radius;
+        float max_query_radius;
+        float point_radius;
+        
+        Point workspace_aabb_min;
+        Point workspace_aabb_max;
+        Point global_aabb_min;
+        Point global_aabb_max;
+        
+        float inverse_scale_factor;
+        uint8_t grid_width;
+        uint8_t index_array_len;
+        
         std::unique_ptr<float[], decltype(&std::free)> point_coord_pool{nullptr, &std::free};
         size_t point_coord_pool_size = 0;
         size_t point_coord_pool_used = 0;
@@ -121,19 +130,6 @@ namespace vamp::collision
 
         XLevelTable x_level_table;
         
-        // Query parameters
-        float min_query_radius;
-        float max_query_radius;
-        float point_radius;
-
-        // Spatial bounds
-        Point workspace_aabb_min;
-        Point workspace_aabb_max;
-        Point global_aabb_min;
-        Point global_aabb_max;
-        float inverse_scale_factor;
-
-        // SIMD broadcast vectors
         FVectorT simd_global_min_x, simd_global_min_y, simd_global_min_z;
         FVectorT simd_global_max_x, simd_global_max_y, simd_global_max_z;
         FVectorT simd_workspace_min_x, simd_workspace_min_y, simd_workspace_min_z;
@@ -147,6 +143,9 @@ namespace vamp::collision
         // - workspace_aabb_min: Lower corner of the robot's workspace AABB
         // - workspace_aabb_max: Upper corner of the robot's workspace AABB
         // - point_radius: Radius associated with each point in the grid
+        //
+        // Assumption:
+        // - Workspace is cubic
         MVT(
             const std::vector<Point>& points,
             const float min_radius,
@@ -183,18 +182,20 @@ namespace vamp::collision
         // Copy constructor
         MVT(const MVT& other) 
             : min_query_radius(other.min_query_radius),
-            max_query_radius(other.max_query_radius),
-            point_radius(other.point_radius),
-            workspace_aabb_min(other.workspace_aabb_min),
-            workspace_aabb_max(other.workspace_aabb_max),
-            global_aabb_min(other.global_aabb_min),
-            global_aabb_max(other.global_aabb_max),
-            inverse_scale_factor(other.inverse_scale_factor),
-            estimated_max_point_per_voxel(other.estimated_max_point_per_voxel),
-            point_coord_pool_size(other.point_coord_pool_size),
-            point_coord_pool_used(other.point_coord_pool_used),
-            index_pool_size(other.index_pool_size),
-            index_pool_used(other.index_pool_used) 
+              max_query_radius(other.max_query_radius),
+              point_radius(other.point_radius),
+              workspace_aabb_min(other.workspace_aabb_min),
+              workspace_aabb_max(other.workspace_aabb_max),
+              global_aabb_min(other.global_aabb_min),
+              global_aabb_max(other.global_aabb_max),
+              inverse_scale_factor(other.inverse_scale_factor),
+              grid_width(other.grid_width),
+              index_array_len(other.index_array_len),
+              point_coord_pool_size(other.point_coord_pool_size),
+              point_coord_pool_used(other.point_coord_pool_used),
+              estimated_max_point_per_voxel(other.estimated_max_point_per_voxel),
+              index_pool_size(other.index_pool_size),
+              index_pool_used(other.index_pool_used) 
         {   
             copy_memory_pool(other);
  
@@ -546,12 +547,8 @@ namespace vamp::collision
                             //     const float dx = center[0] - x_coords[point_idx];
                             //     const float dy = center[1] - y_coords[point_idx];
                             //     const float dz = center[2] - z_coords[point_idx];
-                            //     // const float distance_squared = dx * dx + dy * dy + dz * dz;
-                                
-                            //     float distance_squared = dx * dx;
-                            //     distance_squared = std::fma(dy, dy, distance_squared);
-                            //     distance_squared = std::fma(dz, dz, distance_squared);
-                            //     if (distance_squared <= query_radius_squared) {
+
+                            //     if (dx * dx + dy * dy + dz * dz <= query_radius_squared) {
                             //         return true; // Collision detected
                             //     }
                             // }
@@ -606,19 +603,19 @@ namespace vamp::collision
             std::vector<size_t> points_per_voxel;
             
             // Traverse the three-level structure
-            for (size_t x = 0; x < INDEX_ARRAY_LEN; ++x) {
+            for (size_t x = 0; x < index_array_len; ++x) {
                 if (x_level_table.x_coord_to_y_table_idx[x] != INVALID_INDEX) {
                     non_empty_x_entries++;
                     uint8_t y_level_idx = x_level_table.x_coord_to_y_table_idx[x];
                     const auto& y_level = x_level_table.y_tables[y_level_idx];
                     
-                    for (size_t y = 0; y < INDEX_ARRAY_LEN; ++y) {
+                    for (size_t y = 0; y < index_array_len; ++y) {
                         if (y_level.y_coord_to_z_table_idx[y] != INVALID_INDEX) {
                             non_empty_y_entries++;
                             uint8_t z_level_idx = y_level.y_coord_to_z_table_idx[y];
                             const auto& z_level = y_level.z_tables[z_level_idx];
                             
-                            for (size_t z = 0; z < INDEX_ARRAY_LEN; ++z) {
+                            for (size_t z = 0; z < index_array_len; ++z) {
                                 if (z_level.z_coord_to_voxel_idx[z] != INVALID_INDEX) {
                                     non_empty_z_entries++;
                                     uint8_t voxel_idx = z_level.z_coord_to_voxel_idx[z];
@@ -638,7 +635,7 @@ namespace vamp::collision
             os << "=== Grid Statistics ===" << std::endl;
             os << "Total points stored: " << total_points << std::endl;
             os << "Total voxels: " << total_voxels << std::endl;
-            os << "Non-empty X entries: " << non_empty_x_entries << " / " << INDEX_ARRAY_LEN << std::endl;
+            os << "Non-empty X entries: " << non_empty_x_entries << " / " << (size_t)index_array_len << std::endl;
             os << "Non-empty Y entries: " << non_empty_y_entries << " (total across all X)" << std::endl;
             os << "Non-empty Z entries: " << non_empty_z_entries << " (total across all Y)" << std::endl;
             
@@ -668,10 +665,10 @@ namespace vamp::collision
             os << "Calculation breakdown:" << std::endl;
             os << "  Root table struct: " << sizeof(XLevelTable) << " bytes" << std::endl;
 
-            // Memory for root hash table's lookup array (always INDEX_ARRAY_LEN entries)
-            size_t root_lookup_array = INDEX_ARRAY_LEN * sizeof(uint8_t);
+            // Memory for root hash table's lookup array (always index_array_len entries)
+            size_t root_lookup_array = index_array_len * sizeof(uint8_t);
             x_level_table_memory += root_lookup_array;
-            os << "  Root lookup array (" << INDEX_ARRAY_LEN << " * " << sizeof(uint8_t) << "): " << root_lookup_array << " bytes" << std::endl;
+            os << "  Root lookup array (" << (size_t)index_array_len << " * " << sizeof(uint8_t) << "): " << root_lookup_array << " bytes" << std::endl;
 
             // Memory for Y-level tables vector in root
             size_t root_y_vector = x_level_table.y_tables.capacity() * sizeof(YLevelTable);
@@ -686,7 +683,7 @@ namespace vamp::collision
             size_t total_coordinate_capacity = 0;
 
             // Traverse the three-level structure to calculate actual memory usage
-            for (size_t x = 0; x < INDEX_ARRAY_LEN; ++x) {
+            for (size_t x = 0; x < index_array_len; ++x) {
                 if (x_level_table.x_coord_to_y_table_idx[x] != INVALID_INDEX) {
                     uint8_t y_level_idx = x_level_table.x_coord_to_y_table_idx[x];
                     const auto& y_level = x_level_table.y_tables[y_level_idx];
@@ -694,10 +691,10 @@ namespace vamp::collision
                     // Memory for this Y-level table
                     y_table_count++;
                     y_tables_memory += sizeof(YLevelTable);
-                    y_tables_memory += INDEX_ARRAY_LEN * sizeof(uint8_t); // y_coord_to_z_table_idx array
+                    y_tables_memory += index_array_len * sizeof(uint8_t); // y_coord_to_z_table_idx array
                     y_tables_memory += y_level.z_tables.capacity() * sizeof(ZLevelTable);
                     
-                    for (size_t y = 0; y < INDEX_ARRAY_LEN; ++y) {
+                    for (size_t y = 0; y < index_array_len; ++y) {
                         if (y_level.y_coord_to_z_table_idx[y] != INVALID_INDEX) {
                             uint8_t z_level_idx = y_level.y_coord_to_z_table_idx[y];
                             const auto& z_level = y_level.z_tables[z_level_idx];
@@ -705,10 +702,10 @@ namespace vamp::collision
                             // Memory for this Z-level table
                             z_table_count++;
                             z_tables_memory += sizeof(ZLevelTable);
-                            z_tables_memory += INDEX_ARRAY_LEN * sizeof(uint8_t); // z_coord_to_voxel_idx array
+                            z_tables_memory += index_array_len * sizeof(uint8_t); // z_coord_to_voxel_idx array
                             z_tables_memory += z_level.voxels.capacity() * sizeof(Voxel);
                             
-                            for (size_t z = 0; z < INDEX_ARRAY_LEN; ++z) {
+                            for (size_t z = 0; z < index_array_len; ++z) {
                                 if (z_level.z_coord_to_voxel_idx[z] != INVALID_INDEX) {
                                     uint8_t voxel_idx = z_level.z_coord_to_voxel_idx[z];
                                     const auto& voxel = z_level.voxels[voxel_idx];
@@ -733,14 +730,14 @@ namespace vamp::collision
             os << "  Y-level tables (" << y_table_count << " tables):" << std::endl;
             os << "    - Structs: " << y_table_count << " * " << sizeof(YLevelTable) 
             << " = " << y_table_count * sizeof(YLevelTable) << " bytes" << std::endl;
-            os << "    - Lookup arrays: " << y_table_count << " * " << INDEX_ARRAY_LEN << " * " << sizeof(uint8_t)
-            << " = " << y_table_count * INDEX_ARRAY_LEN * sizeof(uint8_t) << " bytes" << std::endl;
+            os << "    - Lookup arrays: " << y_table_count << " * " << (size_t)index_array_len << " * " << sizeof(uint8_t)
+            << " = " << y_table_count * index_array_len * sizeof(uint8_t) << " bytes" << std::endl;
 
             os << "  Z-level tables (" << z_table_count << " tables):" << std::endl;
             os << "    - Structs: " << z_table_count << " * " << sizeof(ZLevelTable)
             << " = " << z_table_count * sizeof(ZLevelTable) << " bytes" << std::endl;
-            os << "    - Lookup arrays: " << z_table_count << " * " << INDEX_ARRAY_LEN << " * " << sizeof(uint8_t)
-            << " = " << z_table_count * INDEX_ARRAY_LEN * sizeof(uint8_t) << " bytes" << std::endl;
+            os << "    - Lookup arrays: " << z_table_count << " * " << (size_t)index_array_len << " * " << sizeof(uint8_t)
+            << " = " << z_table_count * index_array_len * sizeof(uint8_t) << " bytes" << std::endl;
 
             os << "  Voxels (" << voxel_count << " voxels):" << std::endl;
             os << "    - Structs + bounding boxes: " << voxel_count << " * (" 
@@ -787,19 +784,19 @@ namespace vamp::collision
                << y_start << "-" << y_end << ", "
                << z_start << "-" << z_end << "] ===" << std::endl;
             
-            for (int x = x_start; x <= x_end && x < INDEX_ARRAY_LEN; ++x) {
+            for (int x = x_start; x <= x_end && x < index_array_len; ++x) {
                 if (x_level_table.x_coord_to_y_table_idx[x] == INVALID_INDEX) continue;
                 
                 uint8_t y_level_idx = x_level_table.x_coord_to_y_table_idx[x];
                 const auto& y_level = x_level_table.y_tables[y_level_idx];
                 
-                for (int y = y_start; y <= y_end && y < INDEX_ARRAY_LEN; ++y) {
+                for (int y = y_start; y <= y_end && y < index_array_len; ++y) {
                     if (y_level.y_coord_to_z_table_idx[y] == INVALID_INDEX) continue;
                     
                     uint8_t z_level_idx = y_level.y_coord_to_z_table_idx[y];
                     const auto& z_level = y_level.z_tables[z_level_idx];
                     
-                    for (int z = z_start; z <= z_end && z < INDEX_ARRAY_LEN; ++z) {
+                    for (int z = z_start; z <= z_end && z < index_array_len; ++z) {
                         if (z_level.z_coord_to_voxel_idx[z] == INVALID_INDEX) continue;
                         
                         uint8_t voxel_idx = z_level.z_coord_to_voxel_idx[z];
@@ -835,11 +832,21 @@ namespace vamp::collision
         ~MVT() = default;
 
     private:
-        void initialize_memory_pool() {
+        void initialize_memory_pool() {        
+            // 1. Estimate max # points per voxel
+            //    Here we assume distance between points is 1 cm 
+            const float estimated_max_point_per_voxel_dim = (max_query_radius) / (0.01 * 2);
+            estimated_max_point_per_voxel = next_power_of_two(static_cast<uint8_t>(std::pow(estimated_max_point_per_voxel_dim, 3.0f)));
+            // std::cout << "Num point per voxel: " << estimated_max_point_per_voxel << std::endl;
+           
+            // 2. Calculate grid_width
             const float workspace_width = workspace_aabb_max[0] - workspace_aabb_min[0];
-            const int estimated_points_per_dim = static_cast<int>(
-                                                 std::ceil(workspace_width / (point_radius * 2)) * 0.1);
-            point_coord_pool_size = estimated_points_per_dim * estimated_points_per_dim * estimated_points_per_dim * 3;
+            grid_width = std::min(static_cast<uint8_t>(MAX_GRID_WIDTH), static_cast<uint8_t>(std::ceil(workspace_width / (max_query_radius))));
+            
+            // 3. Estimate pool size of point coord values
+            //    Point coord pool will allocate "estimated_max_point_per_voxel * 3" floats to a newly initialized voxel
+            //    Here we assume grid occupancy is 20%
+            point_coord_pool_size = static_cast<size_t>(grid_width) * grid_width * grid_width * 0.2 * (estimated_max_point_per_voxel * 3);
             
             void* raw_ptr = nullptr;
             if (posix_memalign(&raw_ptr, 32, point_coord_pool_size * sizeof(float)) != 0) {
@@ -848,8 +855,10 @@ namespace vamp::collision
             // std::cout << "Num float in pool: " << point_coord_pool_size << std::endl;
             point_coord_pool.reset(static_cast<float*>(raw_ptr));
 
-            const int estimated_tables = 1 + Y_TABLE_CAPACITY + Y_TABLE_CAPACITY * Z_TABLE_CAPACITY_PER_Y;
-            index_pool_size = estimated_tables * INDEX_ARRAY_LEN;  // INDEX_ARRAY_LEN entries per table
+            // 4. Estimate pool size of table indices
+            const int estimated_tables = 1 + grid_width * 0.5 + grid_width * 0.5 * grid_width;
+            index_array_len = next_power_of_two(grid_width);
+            index_pool_size = estimated_tables * index_array_len;  // There are index_array_len entries per table
             
             void* idx_raw_ptr = nullptr;
             if (posix_memalign(&idx_raw_ptr, 64, index_pool_size * sizeof(uint8_t)) != 0) {
@@ -860,27 +869,19 @@ namespace vamp::collision
 
         void build_spatial_grid(const std::vector<Point>& points) {
             const float workspace_width = workspace_aabb_max[0] - workspace_aabb_min[0];
-            const int grid_width = std::min(static_cast<int>(MAX_GRID_SIZE), 
-                                            static_cast<int>(std::ceil(workspace_width / (max_query_radius))));
-            
             inverse_scale_factor = grid_width / workspace_width;
             
-            const int estimated_max_point_per_voxel_dim = static_cast<int>(
-                                                 std::ceil((max_query_radius) / (point_radius * 2) * 0.25));
-            estimated_max_point_per_voxel = estimated_max_point_per_voxel_dim * estimated_max_point_per_voxel_dim * estimated_max_point_per_voxel_dim;
-            // std::cout << "Num point per voxel: " << estimated_max_point_per_voxel << std::endl;
-           
-            x_level_table.initialize_with_pool(allocate_index_array());
-            x_level_table.y_tables.reserve(Y_TABLE_CAPACITY);
+            x_level_table.initialize_with_pool(allocate_index_array(), index_array_len);
+            x_level_table.y_tables.reserve(grid_width);
             
             for (const auto& point : points) {
                 const int gx = static_cast<int>((point[0] - workspace_aabb_min[0]) * inverse_scale_factor);
                 const int gy = static_cast<int>((point[1] - workspace_aabb_min[1]) * inverse_scale_factor);
                 const int gz = static_cast<int>((point[2] - workspace_aabb_min[2]) * inverse_scale_factor);
                 
-                uint8_t vx = static_cast<uint8_t>(std::clamp(gx, 0, MAX_GRID_SIZE - 1));
-                uint8_t vy = static_cast<uint8_t>(std::clamp(gy, 0, MAX_GRID_SIZE - 1));
-                uint8_t vz = static_cast<uint8_t>(std::clamp(gz, 0, MAX_GRID_SIZE - 1));
+                uint8_t vx = static_cast<uint8_t>(std::clamp(gx, 0, MAX_GRID_WIDTH - 1));
+                uint8_t vy = static_cast<uint8_t>(std::clamp(gy, 0, MAX_GRID_WIDTH - 1));
+                uint8_t vz = static_cast<uint8_t>(std::clamp(gz, 0, MAX_GRID_WIDTH - 1));
 
                 insert_point(vx, vy, vz, point);
             }
@@ -987,8 +988,8 @@ namespace vamp::collision
                 x_level_table.y_tables.emplace_back();
 
                 // Initialize Y-level table with pool
-                x_level_table.y_tables.back().initialize_with_pool(allocate_index_array());
-                x_level_table.y_tables.back().z_tables.reserve(Z_TABLE_CAPACITY_PER_Y);
+                x_level_table.y_tables.back().initialize_with_pool(allocate_index_array(), index_array_len);
+                x_level_table.y_tables.back().z_tables.reserve(grid_width);
             }
             
             auto& y_level_table = x_level_table.y_tables[y_level_index];
@@ -1001,8 +1002,8 @@ namespace vamp::collision
                 y_level_table.z_tables.emplace_back();
 
                 // Initialize Z-level table with pool
-                y_level_table.z_tables.back().initialize_with_pool(allocate_index_array());
-                y_level_table.z_tables.back().voxels.reserve(VOXEL_CAPACITY_PER_Z);
+                y_level_table.z_tables.back().initialize_with_pool(allocate_index_array(), index_array_len);
+                y_level_table.z_tables.back().voxels.reserve(grid_width);
             }
             
             auto& z_level_table = y_level_table.z_tables[z_level_index];
@@ -1014,9 +1015,6 @@ namespace vamp::collision
                 z_level_table.z_coord_to_voxel_idx[voxel_z] = voxel_index;
                 z_level_table.voxels.emplace_back();
 
-                // Reserve space for typical point count per voxel
-                // z_level_table.voxels.back().reserve(RESERVED_POINT_CAPACITY_PER_VOXEL);
-                        
                 // Allocate space from pool
                 float* x_ptr = allocate_coords(estimated_max_point_per_voxel);
                 float* y_ptr = allocate_coords(estimated_max_point_per_voxel);
@@ -1044,15 +1042,30 @@ namespace vamp::collision
         }
 
         uint8_t* allocate_index_array() {
-            if (index_pool_used + INDEX_ARRAY_LEN > index_pool_size) {
+            if (index_pool_used + index_array_len > index_pool_size) {
                 throw std::runtime_error("Index pool exhausted");
             }
             
             uint8_t* result = index_pool.get() + index_pool_used;
-            index_pool_used += INDEX_ARRAY_LEN;
+            index_pool_used += index_array_len;
 
             return result;
         }
+
+        unsigned int next_power_of_two(uint8_t n) {
+            if (n == 0) return 1;
+            n--;
+        
+            // Set all bits to the right of the MSB to 1
+            n |= n >> 1;
+            n |= n >> 2;
+            n |= n >> 4;
+    
+            n++;
+            
+            return n;
+        }
     };
 
+    
 }  // namespace vamp::collision
