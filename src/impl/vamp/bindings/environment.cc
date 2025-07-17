@@ -201,7 +201,7 @@ void vamp::binding::init_environment(nanobind::module_ &pymodule)
             else if (filter_type == "centervox") 
             {
                 start_time = std::chrono::steady_clock::now();
-                filtered = vc::filter_pointcloud_centervox(pc, voxel_size, max_range, origin, workcell_min, workcell_max, cull);
+                filtered = vc::filter_pointcloud_centervox(pc, voxel_size, max_range, origin, workcell_min, workcell_max);
             }
 
             return {filtered, vamp::utils::get_elapsed_nanoseconds(start_time)};
@@ -230,7 +230,7 @@ void vamp::binding::init_environment(nanobind::module_ &pymodule)
             else if (filter_type == "centervox") 
             {
                 start_time = std::chrono::steady_clock::now();
-                filtered = vc::filter_pointcloud_centervox(pc, voxel_size, max_range, origin, workcell_min, workcell_max, cull);
+                filtered = vc::filter_pointcloud_centervox(pc, voxel_size, max_range, origin, workcell_min, workcell_max);
             }
 
             return {filtered, vamp::utils::get_elapsed_nanoseconds(start_time)};
