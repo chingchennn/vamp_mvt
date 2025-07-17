@@ -25,8 +25,8 @@ def main(
     samples_per_object: int = 10000,       # If pointcloud, samples per object to use
     filter_type: str = "scdf",             # Filter type for pointcloud filtering
     filter_radius: float = 0.02,           # Filter radius for pointcloud filtering, required if filter_type="scdf"
-    voxel_filter_size: float = 0.02,       # Voxel filter size for pointcloud filtering, required if filter_type="centervox"
-    filter_cull: bool = True,              # Cull pointcloud around robot by maximum distance
+    voxel_filter_size: float = 0.0308,     # Voxel filter size for pointcloud filtering, required if filter_type="centervox"
+    filter_cull: bool = True,              # Cull pointcloud around robot by maximum distance, unused if filter_type="centervox"
     **kwargs,
     ):
 
@@ -239,7 +239,7 @@ def main(
                 tabulate(
                     pointcloud_stats,
                     headers = [
-                        '    Filter PC Size',
+                        '  Filtered PC Size',
                         '        Filter Time (ms)',
                         'CAPT Build (ms)',
                         'Total Time (ms)',
@@ -252,7 +252,7 @@ def main(
                 tabulate(
                     pointcloud_stats,
                     headers = [
-                        '    Filter PC Size',
+                        '  Filtered PC Size',
                         '        Filter Time (ms)',
                         ' MVT Build (ms)',
                         'Total Time (ms)',
