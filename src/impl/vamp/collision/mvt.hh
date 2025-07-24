@@ -28,7 +28,7 @@ namespace vamp::collision
         static constexpr uint8_t INVALID_INDEX = 255;
         static constexpr uint8_t MAX_GRID_WIDTH = 255;
 
-        struct alignas(64) Voxel {
+        struct alignas(32) Voxel {
             // Structure-of-Arrays for SIMD efficiency
             float* x_coords = nullptr;
             float* y_coords = nullptr;
@@ -52,6 +52,7 @@ namespace vamp::collision
 
             void add_point(const Point& point) {
                 if (point_count >= capacity) {
+                    std::cout << "Try to add " << point_count + 1 << "th point to a voxel" << std::endl;
                     throw std::runtime_error("Voxel capacity exceeded");
                 }
 
@@ -836,7 +837,7 @@ namespace vamp::collision
             // 1. Estimate max # points per voxel
             //    Here we assume distance between points is 1 cm 
             const float estimated_max_point_per_voxel_dim = (max_query_radius) / (0.01 * 2);
-            estimated_max_point_per_voxel = next_power_of_two(static_cast<uint8_t>(std::pow(estimated_max_point_per_voxel_dim, 3.0f)));
+            estimated_max_point_per_voxel = std::max((unsigned int)32, next_power_of_two(static_cast<uint8_t>(std::pow(estimated_max_point_per_voxel_dim, 3.0f))));
             // std::cout << "Num point per voxel: " << estimated_max_point_per_voxel << std::endl;
            
             // 2. Calculate grid_width
