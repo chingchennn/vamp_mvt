@@ -325,11 +325,11 @@ namespace vamp::collision
   
             // Global AABB check - if all spheres are outside, no collision possible
             const auto outside_x_low = (centers[0] + query_radii) < simd_global_min_x;
-            const auto outside_x_high = (centers[0] - query_radii) > simd_global_max_x;
+            const auto outside_x_high = simd_global_max_x < (centers[0] - query_radii);
             const auto outside_y_low = (centers[1] + query_radii) < simd_global_min_y;
-            const auto outside_y_high = (centers[1] - query_radii) > simd_global_max_y;
+            const auto outside_y_high = simd_global_max_y < (centers[1] - query_radii);
             const auto outside_z_low = (centers[2] + query_radii) < simd_global_min_z;
-            const auto outside_z_high = (centers[2] - query_radii) > simd_global_max_z;
+            const auto outside_z_high = simd_global_max_z < (centers[2] - query_radii);
             
             const auto outside_mask = outside_x_low | outside_x_high | 
                                       outside_y_low | outside_y_high | 
