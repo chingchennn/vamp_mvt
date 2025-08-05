@@ -850,7 +850,8 @@ namespace vamp::collision
             point_coord_pool_size = static_cast<size_t>(grid_width) * grid_width * grid_width * 0.2 * (estimated_max_point_per_voxel * 3);
             
             void* raw_ptr = nullptr;
-            if (posix_memalign(&raw_ptr, 32, point_coord_pool_size * sizeof(float)) != 0) {
+            constexpr size_t COORD_ALIGNMENT = FVectorT::num_scalars * sizeof(float); // AVX2: 8*4, NEON: 4*4
+            if (posix_memalign(&raw_ptr, COORD_ALIGNMENT, point_coord_pool_size * sizeof(float)) != 0) {
                 throw std::runtime_error("Failed to allocate aligned memory pool");
             }
             // std::cout << "Num float in pool: " << point_coord_pool_size << std::endl;
