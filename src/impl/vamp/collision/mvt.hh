@@ -18,6 +18,7 @@
 #include <vamp/vector.hh>
 
 #define ALIGN_TO_SIMD_WIDTH(value) ((((value) + FVectorT::num_scalars - 1) / FVectorT::num_scalars) * FVectorT::num_scalars)
+#define ALIGN_TO_CACHE_LINE(value) ((((value) + 64 - 1) / 64) * 64)
 
 namespace vamp::collision
 {
@@ -836,7 +837,7 @@ namespace vamp::collision
     private:
         void initialize_memory_pool() {        
             // 1. Estimate max # points per voxel
-            //    Here we assume distance between points is 1 cm 
+            //    Here we assume distance between points is 2 cm 
             constexpr size_t SIMD_WIDTH = FVectorT::num_scalars;
             const float estimated_max_point_per_voxel_dim = (max_query_radius) / (0.01 * 2);
             estimated_max_point_per_voxel = static_cast<unsigned int>(std::pow(estimated_max_point_per_voxel_dim, 3.0f));
@@ -862,7 +863,7 @@ namespace vamp::collision
 
             // 4. Estimate pool size of table indices
             const int estimated_tables = 1 + grid_width * 0.5 + grid_width * 0.5 * grid_width;
-            index_array_len = next_power_of_two(grid_width);
+            index_array_len = ALIGN_TO_CACHE_LINE(grid_width);
             index_pool_size = estimated_tables * index_array_len;  // There are index_array_len entries per table
             
             void* idx_raw_ptr = nullptr;
