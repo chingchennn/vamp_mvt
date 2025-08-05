@@ -17,6 +17,8 @@
 #include <vamp/collision/math.hh>
 #include <vamp/vector.hh>
 
+#define ALIGN_TO_SIMD_WIDTH(value) ((((value) + FVectorT::num_scalars - 1) / FVectorT::num_scalars) * FVectorT::num_scalars)
+
 namespace vamp::collision
 {
     struct MVT
@@ -434,8 +436,7 @@ namespace vamp::collision
 
                             // Process points in SIMD chunks
                             size_t point_idx = 0;
-                            constexpr size_t SIMD_MASK = ~(SIMD_WIDTH - 1);
-                            const size_t num_points_aligned = (num_points + SIMD_WIDTH - 1) & SIMD_MASK;
+                            const size_t num_points_aligned = ALIGN_TO_SIMD_WIDTH(num_points);
 
                             // Process all points including zero padding with SIMD
                             for (; point_idx < num_points_aligned; point_idx += SIMD_WIDTH) {
@@ -836,8 +837,10 @@ namespace vamp::collision
         void initialize_memory_pool() {        
             // 1. Estimate max # points per voxel
             //    Here we assume distance between points is 1 cm 
+            constexpr size_t SIMD_WIDTH = FVectorT::num_scalars;
             const float estimated_max_point_per_voxel_dim = (max_query_radius) / (0.01 * 2);
-            estimated_max_point_per_voxel = std::max((unsigned int)32, next_power_of_two(static_cast<uint8_t>(std::pow(estimated_max_point_per_voxel_dim, 3.0f))));
+            estimated_max_point_per_voxel = static_cast<unsigned int>(std::pow(estimated_max_point_per_voxel_dim, 3.0f));
+            estimated_max_point_per_voxel = ALIGN_TO_SIMD_WIDTH(estimated_max_point_per_voxel);
             // std::cout << "Num point per voxel: " << estimated_max_point_per_voxel << std::endl;
            
             // 2. Calculate grid_width
@@ -850,7 +853,7 @@ namespace vamp::collision
             point_coord_pool_size = static_cast<size_t>(grid_width) * grid_width * grid_width * 0.2 * (estimated_max_point_per_voxel * 3);
             
             void* raw_ptr = nullptr;
-            constexpr size_t COORD_ALIGNMENT = FVectorT::num_scalars * sizeof(float); // AVX2: 8*4, NEON: 4*4
+            constexpr size_t COORD_ALIGNMENT = SIMD_WIDTH * sizeof(float); // AVX2: 8*4, NEON: 4*4
             if (posix_memalign(&raw_ptr, COORD_ALIGNMENT, point_coord_pool_size * sizeof(float)) != 0) {
                 throw std::runtime_error("Failed to allocate aligned memory pool");
             }
@@ -1029,9 +1032,7 @@ namespace vamp::collision
 
         float* allocate_coords(size_t count) {
             // Align count to SIMD boundary
-            constexpr size_t SIMD_WIDTH = FVectorT::num_scalars;
-            constexpr size_t SIMD_MASK = ~(SIMD_WIDTH - 1);
-            const size_t aligned_count = (count + SIMD_WIDTH - 1) & SIMD_MASK;
+            const size_t aligned_count = ALIGN_TO_SIMD_WIDTH(count);
             if (point_coord_pool_used + aligned_count > point_coord_pool_size) {
                 throw std::runtime_error("Point coordinate pool exhausted");
             }
