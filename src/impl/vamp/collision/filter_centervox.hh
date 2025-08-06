@@ -13,7 +13,7 @@
 
 namespace vamp::collision
 {
-    struct alignas(16) Voxel {
+    struct Voxel {
         Point stored_point;
         Point voxel_center;
         float stored_point_dist_sq = 0.0f;
@@ -118,11 +118,11 @@ namespace vamp::collision
             
             // Allocate aligned memory for voxels
             void* raw_memory = nullptr;
-            int result = posix_memalign(&raw_memory, 32, sizeof(Voxel) * voxel_pool_size);
+            int result = posix_memalign(&raw_memory, 32, sizeof(Voxel) * voxel_pool_size); // sizeof(Voxel): 32 bytes
             if (result != 0 || raw_memory == nullptr) {
                 throw std::bad_alloc();
             }
-            
+
             voxel_pool.reset(static_cast<Voxel*>(raw_memory));
         }
         
