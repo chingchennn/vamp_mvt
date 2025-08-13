@@ -839,7 +839,7 @@ namespace vamp::collision
             // 1. Estimate max # points per voxel
             //    Here we assume distance between points is 2 cm 
             constexpr size_t SIMD_WIDTH = FVectorT::num_scalars;
-            const float estimated_max_point_per_voxel_dim = (max_query_radius) / (0.01 * 2);
+            const float estimated_max_point_per_voxel_dim = (max_query_radius) / (0.005 * 2);
             estimated_max_point_per_voxel = static_cast<unsigned int>(std::pow(estimated_max_point_per_voxel_dim, 3.0f));
             estimated_max_point_per_voxel = ALIGN_TO_SIMD_WIDTH(estimated_max_point_per_voxel);
             // std::cout << "Num point per voxel: " << estimated_max_point_per_voxel << std::endl;
