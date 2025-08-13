@@ -184,6 +184,14 @@ namespace vamp::binding
         }
 
         inline static auto
+        validate_motion(const Configuration &start, const Configuration &goal, const EnvironmentInput &environment)
+            -> bool
+        {
+            return vamp::planning::validate_motion<Robot, rake, Robot::resolution>(
+                        start, goal, EnvironmentVector(environment));
+        }
+
+        inline static auto
         validate(const ConfigurationArray &configuration, const EnvironmentInput &environment, bool check_bounds = false) -> bool
         {
             const Configuration configuration_v(configuration);
@@ -728,6 +736,13 @@ namespace vamp::binding
             "configuration"_a,
             "Returns the position and orientation (as a xyzw quaternion) of the robot's end-effector.");
 
+        submodule.def(
+            "validate_motion",
+            RH::validate_motion, 
+            "start"_a,
+            "goal"_a, 
+            "environment"_a = vamp::collision::Environment<float>(),
+            "Validate motion between configurations");
         return submodule;
     }
 }  // namespace vamp::binding
