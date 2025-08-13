@@ -7,6 +7,13 @@ import logging
 import torch
 import torch.nn as nn
 
+try:
+    from rknn.api import RKNN
+    RKNN_AVAILABLE = True
+except ImportError:
+    RKNN = None
+    RKNN_AVAILABLE = False
+
 # Configure logging
 logging.basicConfig(level=logging.DEBUG, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
@@ -122,15 +129,202 @@ class OrangePiNPUBackend(HardwareBackend):
     
     def __init__(self):
         self.cpu_backend = CPUBackend()
-        logger.info("OrangePi NPU: Using CPU fallback (NPU implementation pending)")
-    
+        self.rknn_models = {}  # Cache for loaded RKNN models
+        logger.info("OrangePi NPU backend initialized")
+        
+        # Check if RKNN is available
+        if RKNN_AVAILABLE:
+            try:
+                # Test RKNN functionality
+                test_rknn = RKNN(verbose=False)
+                test_rknn.release()
+                self.rknn_available = True
+                logger.info("RKNN library detected - NPU acceleration enabled")
+            except Exception as e:
+                self.rknn_available = False
+                logger.warning(f"RKNN library found but not functional: {e}")
+        else:
+            self.rknn_available = False
+            logger.info("RKNN library not available - using CPU fallback")
+
     def load_model(self, model_path: str) -> Any:
-        # TODO: Replace with Raspberry Pi NPU model loading
-        return self.cpu_backend.load_model(model_path)
+        """Load model and convert to RKNN if needed"""
+        if not self.rknn_available:
+            return self.cpu_backend.load_model(model_path)
+        
+        try:
+            path = Path(model_path)
+            model_name = path.stem
+            model_dir = path.parent
+            
+            # Define paths for converted models in same directory
+            onnx_path = model_dir / f"{model_name}.onnx"
+            rknn_path = model_dir / f"{model_name}.rknn"
+            
+            # Check if already converted and cached in memory
+            if model_name in self.rknn_models:
+                logger.debug(f"Using cached RKNN model: {model_name}")
+                return self.rknn_models[model_name]
+            
+            # Check if RKNN file already exists on disk
+            if rknn_path.exists():
+                logger.info(f"Loading existing RKNN model: {rknn_path}")
+                rknn_model = self._load_existing_rknn(str(rknn_path))
+                self.rknn_models[model_name] = rknn_model
+                return rknn_model
+            
+            # Check if ONNX file exists, if not convert from PyTorch
+            if not onnx_path.exists():
+                logger.info(f"Converting {model_name} from PKL to ONNX...")
+                pytorch_model = self._load_pytorch_from_pkl(model_path)
+                self._convert_to_onnx(pytorch_model, str(onnx_path), model_path)
+            else:
+                logger.info(f"Using existing ONNX model: {onnx_path}")
+            
+            # Convert ONNX to RKNN
+            logger.info(f"Converting {model_name} from ONNX to RKNN...")
+            rknn_model = self._convert_to_rknn(str(onnx_path), str(rknn_path))
+            
+            # Cache the model
+            self.rknn_models[model_name] = rknn_model
+            logger.info(f"Successfully loaded {model_name} on NPU")
+            
+            return rknn_model
+            
+        except Exception as e:
+            logger.error(f"Failed to load model on NPU: {e}")
+            logger.info("Falling back to CPU backend")
+            return self.cpu_backend.load_model(model_path)
     
     def predict(self, model: Any, inputs: np.ndarray) -> np.ndarray:
-        # TODO: Replace with OrangePi NPU inference
-        return self.cpu_backend.predict(model, inputs)
+        """Run inference on NPU or fall back to CPU"""
+        if not self.rknn_available or not hasattr(model, 'inference'):
+            return self.cpu_backend.predict(model, inputs)
+        
+        try:
+            # Ensure input is the right shape and type
+            if inputs.ndim == 1:
+                inputs = inputs.reshape(1, -1)
+            inputs = inputs.astype(np.float32)
+            
+            # Run NPU inference
+            outputs = model.inference(inputs=[inputs])
+            return outputs[0]  # RKNN returns list of outputs
+            
+        except Exception as e:
+            logger.error(f"NPU inference failed: {e}")
+            logger.info("Falling back to CPU")
+            return self.cpu_backend.predict(model, inputs)
+
+    def _load_pytorch_from_pkl(self, model_path: str):
+        """Load PyTorch model from .pkl file"""
+        path = Path(model_path)
+        
+        # Try loading the pickle file
+        try:
+            import pickle
+            with open(path, 'rb') as f:
+                state_dict = pickle.load(f)
+        except:
+            # If pickle fails, try PyTorch load
+            state_dict = torch.load(path, map_location='cpu')
+        
+        # Determine model type and create appropriate model
+        filename = path.name.lower()
+        if "encoder" in filename:
+            model = Encoder()
+            model.load_state_dict(state_dict)
+        elif "planner" in filename:
+            model = Planner(28 + ROBOT_DOF + ROBOT_DOF, ROBOT_DOF)  # latent + start + goal -> next_config
+            model.load_state_dict(state_dict)
+        else:
+            raise ValueError(f"Unknown model type: {filename}")
+        
+        model.eval()
+        return model
+   
+    def _convert_to_onnx(self, pytorch_model, onnx_path: str, original_path: str) -> None:
+        """Convert PyTorch model to ONNX"""
+        model_name = Path(original_path).stem
+        
+        # Determine input shape based on model type
+        if "encoder" in model_name.lower():
+            # Encoder: point cloud input
+            dummy_input = torch.randn(1, MAX_POINTCLOUD_SIZE * 3)
+            input_names = ['point_cloud']
+            output_names = ['env_encoding']
+        else:
+            # Planner: latent + start + goal
+            dummy_input = torch.randn(1, 28 + ROBOT_DOF + ROBOT_DOF)
+            input_names = ['planning_features']
+            output_names = ['waypoint']
+        
+        # Export to ONNX
+        torch.onnx.export(
+            pytorch_model,
+            dummy_input,
+            onnx_path,
+            export_params=True,
+            opset_version=11,
+            do_constant_folding=True,
+            input_names=input_names,
+            output_names=output_names
+        )
+        
+        logger.debug(f"Converted {model_name} to ONNX: {onnx_path}")
+
+    def _convert_to_rknn(self, onnx_path: str, rknn_path: str):
+        """Convert ONNX model to RKNN"""
+        # Create RKNN instance
+        if not RKNN_AVAILABLE:
+            raise RuntimeError("RKNN not available for conversion")
+        
+        # Create RKNN instance
+        rknn = RKNN(verbose=False)
+        
+        # Configure for RK3588 (OrangePi 5/5B)
+        ret = rknn.config(
+            target_platform='rk3588',
+            quantized_dtype='w8a8',  # 8-bit weights, 8-bit activations
+            optimization_level=1,
+            quantized_algorithm='normal'
+        )
+        if ret != 0:
+            raise RuntimeError(f"RKNN config failed with code {ret}")
+        
+        # Load ONNX model
+        ret = rknn.load_onnx(model=onnx_path)
+        if ret != 0:
+            raise RuntimeError(f"RKNN load_onnx failed with code {ret}")
+        
+        # Build the model (quantization happens here)
+        ret = rknn.build(do_quantization=False)
+        if ret != 0:
+            raise RuntimeError(f"RKNN build failed with code {ret}")
+        
+        # Export RKNN model
+        ret = rknn.export_rknn(rknn_path)
+        if ret != 0:
+            raise RuntimeError(f"RKNN export failed with code {ret}")
+        
+        # Initialize runtime for inference
+        ret = rknn.init_runtime(target='rk3588')
+        if ret != 0:
+            raise RuntimeError(f"RKNN init_runtime failed with code {ret}")
+        
+        logger.debug(f"Converted and saved RKNN model: {rknn_path}")
+        return rknn
+
+    def __del__(self):
+        """Cleanup RKNN models"""
+        # Release RKNN models
+        for model_name, rknn_model in self.rknn_models.items():
+            try:
+                if hasattr(rknn_model, 'release'):
+                    rknn_model.release()
+                    logger.debug(f"Released RKNN model: {model_name}")
+            except:
+                pass
 
 class RaspberryPiNPUBackend(HardwareBackend):
     """Raspberry Pi NPU backend with CPU fallback"""
@@ -366,12 +560,7 @@ class MPNetPlanner:
         elif len(pointcloud) < MAX_POINTCLOUD_SIZE:
             padding = np.zeros((MAX_POINTCLOUD_SIZE - len(pointcloud), 3))
             pointcloud = np.vstack([pointcloud, padding])
-        
-        # # Normalize point cloud (center around origin)
-        # if len(pointcloud) > 0:
-        #     centroid = np.mean(pointcloud, axis=0)
-        #     pointcloud = pointcloud - centroid
-            
+
         return pointcloud.astype(np.float32).flatten()
     
     def _prepare_planning_input(self, current: np.ndarray, goal: np.ndarray) -> np.ndarray:
