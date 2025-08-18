@@ -315,6 +315,26 @@ class OrangePiNPUBackend(HardwareBackend):
         logger.debug(f"Converted and saved RKNN model: {rknn_path}")
         return rknn
 
+    def _load_existing_rknn(self, rknn_path: str):
+        """Load existing RKNN model from disk"""
+        if not RKNN_AVAILABLE:
+            raise RuntimeError("RKNN not available for loading")
+            
+        rknn = RKNN(verbose=False)
+        
+        # Load the RKNN model
+        ret = rknn.load_rknn(rknn_path)
+        if ret != 0:
+            raise RuntimeError(f"Failed to load RKNN model: {rknn_path}, code {ret}")
+        
+        # Initialize runtime for inference
+        ret = rknn.init_runtime(target='rk3588')
+        if ret != 0:
+            raise RuntimeError(f"RKNN init_runtime failed with code {ret}")
+        
+        logger.debug(f"Loaded existing RKNN model: {rknn_path}")
+        return rknn
+
     def __del__(self):
         """Cleanup RKNN models"""
         # Release RKNN models
