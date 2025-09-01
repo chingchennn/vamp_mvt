@@ -16,6 +16,7 @@ def main(
     planner: str = "rrtc",                 # Planner name to use
     dataset: str = "problems.pkl",         # Pickled dataset to use
     problem: Union[str, List[str]] = [],   # Problem name or list of problems to evaluate
+    problem_index: Union[int, List[int]] = None,# Problem index or list of indices to evaluate
     trials: int = 1,                       # Number of trials to evaluate each instance
     sampler: str = "halton",               # Sampler to use.
     skip_rng_iterations: int = 0,          # Skip a number of RNG iterations
@@ -68,6 +69,10 @@ def main(
                     f"Problem `{problem_name}` not available! Available problems: {problem_names}"
                     )
 
+    if problem_index is not None:
+        if isinstance(problem_index, int):
+            problem_index = [problem_index]
+
     (vamp_module, planner_func, plan_settings,
      simp_settings) = vamp.configure_robot_and_planner_with_kwargs(robot, planner, **kwargs)
 
@@ -87,6 +92,9 @@ def main(
         invalids = []
         print(f"Evaluating {robot} on {name}: ")
         for i, data in tqdm(enumerate(pset)):
+            if problem_index is not None and i not in problem_index:
+                continue
+                
             total_problems += 1
 
             if not data['valid']:
