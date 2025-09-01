@@ -15,7 +15,7 @@ except ImportError:
     RKNN_AVAILABLE = False
 
 # Configure logging
-logging.basicConfig(level=logging.DEBUG, format='%(levelname)s: %(message)s')
+logging.basicConfig(level=logging.CRITICAL, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
 MAX_POINTCLOUD_SIZE = 11978
@@ -68,7 +68,7 @@ class HardwareBackend(ABC):
         pass
     
     @abstractmethod
-    def predict(self, model: Any, inputs: np.ndarray) -> np.ndarray:
+    def predict(self, model: Any, inputs: np.ndarray) -> Tuple[np.ndarray, float]:
         pass
 
 class CPUBackend(HardwareBackend):
@@ -106,21 +106,25 @@ class CPUBackend(HardwareBackend):
         else:
             raise ValueError(f"Unsupported format: {path.suffix}")
     
-    def predict(self, model: Any, inputs: np.ndarray) -> np.ndarray:
+    def predict(self, model: Any, inputs: np.ndarray) -> Tuple[np.ndarray, float]:
         if hasattr(model, 'predict'):  # sklearn/pickle
-            return model.predict(inputs)
+            start_time = time.time()
+            output = model.predict(inputs)
+            return output, (time.time() - start_time) * 1000
         elif hasattr(model, '__call__'):  # pytorch
             import torch
             with torch.no_grad():
                 tensor_input = torch.from_numpy(inputs).float()
                 if len(tensor_input.shape) == 1:
                     tensor_input = tensor_input.unsqueeze(0)
+                start_time = time.time()
                 output = model(tensor_input)
-                return output.numpy()
+                return output.numpy(), (time.time() - start_time) * 1000
         elif hasattr(model, 'run'):  # onnx
             input_name = model.get_inputs()[0].name
+            start_time = time.time()
             outputs = model.run(None, {input_name: inputs})
-            return outputs[0]
+            return outputs[0], (time.time() - start_time) * 1000
         else:
             raise ValueError("Unknown model type")
 
@@ -196,7 +200,7 @@ class OrangePiNPUBackend(HardwareBackend):
             logger.info("Falling back to CPU backend")
             return self.cpu_backend.load_model(model_path)
     
-    def predict(self, model: Any, inputs: np.ndarray) -> np.ndarray:
+    def predict(self, model: Any, inputs: np.ndarray) -> Tuple[np.ndarray, float]:
         """Run inference on NPU or fall back to CPU"""
         if not self.rknn_available or not hasattr(model, 'inference'):
             return self.cpu_backend.predict(model, inputs)
@@ -208,8 +212,9 @@ class OrangePiNPUBackend(HardwareBackend):
             inputs = inputs.astype(np.float32)
             
             # Run NPU inference
+            start_time = time.time()
             outputs = model.inference(inputs=[inputs])
-            return outputs[0]  # RKNN returns list of outputs
+            return outputs[0], (time.time() - start_time) * 1000  # RKNN returns list of outputs
             
         except Exception as e:
             logger.error(f"NPU inference failed: {e}")
@@ -357,9 +362,9 @@ class RaspberryPiNPUBackend(HardwareBackend):
         # TODO: Replace with Raspberry Pi NPU model loading
         return self.cpu_backend.load_model(model_path)
     
-    def predict(self, model: Any, inputs: np.ndarray) -> np.ndarray:
+    def predict(self, model: Any, inputs: np.ndarray) -> Tuple[np.ndarray, float]:
         # TODO: Replace with Raspberry Pi NPU inference
-        return self.cpu_backend.predict(model, inputs)
+        return self.cpu_backend.predict(model, inputs), 0.0
 
 class MPNetPlanner:
     """Compact MPNet planner using Python orchestration"""
@@ -369,8 +374,6 @@ class MPNetPlanner:
         'opi_npu': OrangePiNPUBackend,
         'rpi_npu': RaspberryPiNPUBackend,
     }
-    
-    PNET_INFERENCE_CNT = 0
 
     def __init__(self, encoder_path: str, planner_path: str, hardware: str = 'cpu'):
         """Initialize MPNet with specified hardware backend"""
@@ -381,6 +384,11 @@ class MPNetPlanner:
         self.backend = self.BACKENDS[hardware]()
         self.hardware = hardware
         
+        self.accum_val_time = 0
+        self.pnet_inference_cnt = 0
+        self.accum_enet_infer_time = 0
+        self.accum_pnet_infer_time = 0
+
         # Load models
         logger.info(f"Loading encoder: {encoder_path}")
         self.encoder = self.backend.load_model(encoder_path)
@@ -400,7 +408,8 @@ class MPNetPlanner:
             logger.debug(f"Point cloud shape after preprocessing: {np.array(processed_cloud).shape}")
             
             # Encode
-            self.latent_code = self.backend.predict(self.encoder, processed_cloud)
+            np.savetxt('enet_input.txt', processed_cloud, delimiter=',')
+            self.latent_code, self.accum_enet_infer_time = self.backend.predict(self.encoder, processed_cloud)
             logger.debug(f"Encoded {len(pointcloud)} points to latent shape: {self.latent_code.shape}")
             return True
         except Exception as e:
@@ -427,15 +436,18 @@ class MPNetPlanner:
             logger.error("Environment not encoded. Call encode_environment() first.")
             return None
         
-        print(f"Start shape: {len(start)}, Goal shape: {len(goal)}")
+        logger.info(f"Start shape: {len(start)}, Goal shape: {len(goal)}")
         
         start_time = time.time()
         
         # Check direct connection first
+        val_start_time = time.time()
         if robot_module.validate_motion(robot_module.Configuration(start), robot_module.Configuration(goal), environment):
+            self.accum_val_time = self.accum_val_time + (time.time() - val_start_time) * 1000
             logger.info("Direct connection found")
             return [start, goal]
-        
+        self.accum_val_time = self.accum_val_time + (time.time() - val_start_time) * 1000
+
         best_path = None
         best_distance_to_goal = float('inf')
         
@@ -458,9 +470,12 @@ class MPNetPlanner:
                 distance_to_goal = np.linalg.norm(final_config - goal)
                 if distance_to_goal < 1.0:
                     path.append(goal)
-                    logger.info(f"Path found in iteration {iteration + 1}: {len(path)} waypoints")
-                    logger.info(f"Planning time: {(time.time() - start_time) * 1000:.1f}ms")
-                    logger.info(f"Planning Network Inference Count: {self.PNET_INFERENCE_CNT}")
+                    print(f"Path found in iteration {iteration + 1}: {len(path)} waypoints")
+                    print(f"Planning time: {(time.time() - start_time) * 1000:.1f}ms")
+                    print(f"Planning Network Inference Count: {self.pnet_inference_cnt}")
+                    print(f"Accum. motion validation time: {self.accum_val_time}")
+                    print(f"Accum. ENet inference time: {self.accum_enet_infer_time}")
+                    print(f"Accum. PNet inference time: {self.accum_pnet_infer_time}")
                     return path
                 
                 # Track best partial path
@@ -494,10 +509,13 @@ class MPNetPlanner:
         backward_end = backward_path[-1]
         
         # Check if paths can be connected
+        val_start_time = time.time()
         if robot_module.validate_motion(robot_module.Configuration(forward_end), robot_module.Configuration(backward_end), environment):
+            self.accum_val_time = self.accum_val_time + (time.time() - val_start_time) * 1000
             # Merge paths (reverse backward path since it was planned goal->start)
             merged_path = forward_path + list(reversed(backward_path[:-1]))
             return merged_path
+        self.accum_val_time = self.accum_val_time + (time.time() - val_start_time) * 1000
         
         # If direct connection fails, try recursive planning between end points
         bridge_path = self._single_planning_attempt(forward_end, backward_end, robot_module, environment, max_steps // 4)
@@ -522,7 +540,9 @@ class MPNetPlanner:
                 break
             
             # Validate motion
+            val_start_time = time.time()
             if robot_module.validate_motion(robot_module.Configuration(current), robot_module.Configuration(next_config), environment):
+                self.accum_val_time = self.accum_val_time + (time.time() - val_start_time) * 1000
                 path.append(next_config.copy())
                 current = next_config
                 
@@ -531,13 +551,17 @@ class MPNetPlanner:
                     return path
             else:
                 # Collision detected - try to recover with slight perturbation
+                self.accum_val_time = self.accum_val_time + (time.time() - val_start_time) * 1000
                 perturbed_config = self._add_noise_to_config(next_config, noise_scale=0.25)
+                val_start_time = time.time()
                 if robot_module.validate_motion(robot_module.Configuration(current), robot_module.Configuration(perturbed_config), environment):
+                    self.accum_val_time = self.accum_val_time + (time.time() - val_start_time) * 1000
                     logger.debug(f"Recovered with perturbed config: {perturbed_config}")
                     path.append(perturbed_config.copy())
                     current = perturbed_config
                 else:
                     # Failed to recover, stop this planning attempt
+                    self.accum_val_time = self.accum_val_time + (time.time() - val_start_time) * 1000
                     break
         
         return path if len(path) > 1 else None
@@ -549,8 +573,9 @@ class MPNetPlanner:
             planning_input = self._prepare_planning_input(current, goal)
             
             # Predict
-            prediction = self.backend.predict(self.planner, planning_input)
-            self.PNET_INFERENCE_CNT = self.PNET_INFERENCE_CNT + 1
+            prediction, infer_time = self.backend.predict(self.planner, planning_input)
+            self.accum_pnet_infer_time = self.accum_pnet_infer_time + infer_time
+            self.pnet_inference_cnt = self.pnet_inference_cnt + 1
             
             # Post-process prediction
             return self._postprocess_prediction(prediction, current)
