@@ -837,18 +837,20 @@ namespace vamp::collision
             // 1. Estimate max # points per voxel
             //    Here we assume distance between points is 2 cm 
             const float estimated_max_point_per_voxel_dim = (max_query_radius) / 0.02;
-            estimated_max_point_per_voxel = std::min((unsigned int)32, next_power_of_two(static_cast<unsigned int>(std::pow(estimated_max_point_per_voxel_dim, 3.0f))));
-
+            // estimated_max_point_per_voxel = std::min((unsigned int)32, next_power_of_two(static_cast<unsigned int>(std::pow(estimated_max_point_per_voxel_dim, 3.0f))));
+            estimated_max_point_per_voxel = std::min((unsigned int)32, 
+                                            std::max((unsigned int)(FVectorT::num_scalars/sizeof(float)), 
+                                            next_power_of_two(static_cast<unsigned int>(std::pow(estimated_max_point_per_voxel_dim, 3.0f)))));
             // std::cout << "Num point per voxel: " << estimated_max_point_per_voxel << std::endl;
            
             // 2. Calculate grid_width
             const float workspace_width = workspace_aabb_max[0] - workspace_aabb_min[0];
-            grid_width = std::min(static_cast<uint8_t>(MAX_GRID_WIDTH), static_cast<uint8_t>(std::ceil(workspace_width / (max_query_radius))));
+            grid_width = std::min(static_cast<uint8_t>(MAX_GRID_WIDTH), static_cast<uint8_t>(std::floor(workspace_width / (max_query_radius))));
             
             // 3. Estimate pool size of point coord values
             //    Point coord pool will allocate "estimated_max_point_per_voxel * 3" floats to a newly initialized voxel
             //    Here we assume grid occupancy is 20%
-            point_coord_pool_size = static_cast<size_t>(grid_width) * grid_width * grid_width * 0.2 * (estimated_max_point_per_voxel * 3);
+            point_coord_pool_size = static_cast<size_t>(grid_width) * grid_width * grid_width * 0.1 * (estimated_max_point_per_voxel * 3);
             
             void* raw_ptr = nullptr;
             constexpr size_t COORD_ALIGNMENT = FVectorT::num_scalars * sizeof(float); // AVX2: 8*4, NEON: 4*4
