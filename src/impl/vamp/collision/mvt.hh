@@ -181,6 +181,7 @@ namespace vamp::collision
             // std::ofstream log_file("scripts/log/tmp.txt");
             // print_grid_structure(log_file);
             // print_voxel_details(0, 255, 0, 255, 0, 255, log_file);
+            // benchmark_collision_queries("../cc_queries_mvt.txt");
         }
 
         // Copy constructor
@@ -576,8 +577,204 @@ namespace vamp::collision
             
             return false; // No collisions detected
         }
+
+        ~MVT() = default;
+
+    private:
+        struct QueryData {
+            std::vector<std::vector<float>> x_coords;
+            std::vector<std::vector<float>> y_coords;
+            std::vector<std::vector<float>> z_coords;
+            std::vector<std::vector<float>> radii;
+        };
         
-        // Print structure of the level hashing grid
+        // Parse query data from text file
+        bool loadQueries(const std::string& filename, QueryData& queries) {
+            std::ifstream file(filename);
+            if (!file.is_open()) {
+                std::cerr << "Error: Cannot open query file: " << filename << std::endl;
+                return false;
+            }
+        
+            queries.x_coords.clear();
+            queries.y_coords.clear();
+            queries.z_coords.clear();
+            queries.radii.clear();
+        
+            std::string line;
+            while (std::getline(file, line)) {
+                // Parse line format: [ [x values] ] [ [y values] ] [ [z values] ] [ [radii] ]
+                std::vector<std::vector<float>> line_data(4);
+                
+                std::istringstream iss(line);
+                std::string token;
+                int array_idx = 0;
+                
+                while (iss >> token && array_idx < 4) {
+                    if (token == "[") {
+                        // Skip opening bracket
+                        continue;
+                    } else if (token == "]") {
+                        array_idx++;
+                        continue;
+                    } else if (token.front() == '[' && token.back() != ']') {
+                        // Start of array, remove opening bracket
+                        token = token.substr(1);
+                    }
+                    
+                    // Clean up token (remove commas, brackets)
+                    token.erase(std::remove(token.begin(), token.end(), ','), token.end());
+                    if (token.back() == ']') {
+                        token.pop_back();
+                    }
+                    
+                    if (!token.empty()) {
+                        try {
+                            float value = std::stof(token);
+                            line_data[array_idx].push_back(value);
+                        } catch (const std::exception& e) {
+                            // Skip invalid tokens
+                        }
+                    }
+                }
+                
+                if (!line_data[0].empty()) {
+                    queries.x_coords.push_back(line_data[0]);
+                    queries.y_coords.push_back(line_data[1]);
+                    queries.z_coords.push_back(line_data[2]);
+                    queries.radii.push_back(line_data[3]);
+                }
+            }
+            
+            file.close();
+            // std::cout << "Loaded " << queries.x_coords.size() << " query sets from " << filename << std::endl;
+            return true;
+        }
+        
+        void benchmark_collision_queries(const std::string& query_file) noexcept {
+            // Load query data from file
+            QueryData queries;
+            if (!loadQueries(query_file, queries)) {
+                std::cerr << "Failed to load queries from: " << query_file << std::endl;
+                return;
+            }
+            
+            if (queries.x_coords.empty()) {
+                std::cerr << "No valid queries loaded from file" << std::endl;
+                return;
+            }
+            
+            // Validate that all coordinate arrays have the same size
+            const size_t num_batches = queries.x_coords.size();
+            std::cout << "num_batches = " << num_batches << std::endl;
+            if (queries.y_coords.size() != num_batches || 
+                queries.z_coords.size() != num_batches || 
+                queries.radii.size() != num_batches) {
+                std::cerr << "Error: Inconsistent batch sizes in query data" << std::endl;
+                return;
+            }
+            
+            // Flatten all queries into single vectors
+            std::vector<float> all_x_coords;
+            std::vector<float> all_y_coords;
+            std::vector<float> all_z_coords;
+            std::vector<float> all_radii;
+            
+            for (size_t batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
+                const auto& x_batch = queries.x_coords[batch_idx];
+                const auto& y_batch = queries.y_coords[batch_idx];
+                const auto& z_batch = queries.z_coords[batch_idx];
+                const auto& r_batch = queries.radii[batch_idx];
+                
+                // Validate batch consistency
+                const size_t batch_size = x_batch.size();
+                if (y_batch.size() != batch_size || 
+                    z_batch.size() != batch_size || 
+                    r_batch.size() != batch_size) {
+                    std::cerr << "Warning: Inconsistent sizes in batch " << batch_idx << ", skipping..." << std::endl;
+                    continue;
+                }
+                
+                // Append individual queries to flattened vectors
+                all_x_coords.insert(all_x_coords.end(), x_batch.begin(), x_batch.end());
+                all_y_coords.insert(all_y_coords.end(), y_batch.begin(), y_batch.end());
+                all_z_coords.insert(all_z_coords.end(), z_batch.begin(), z_batch.end());
+                all_radii.insert(all_radii.end(), r_batch.begin(), r_batch.end());
+            }
+            
+            const size_t total_individual_queries = all_x_coords.size();
+            if (total_individual_queries == 0) {
+                std::cerr << "No valid individual queries found" << std::endl;
+                return;
+            }
+            
+            std::cout << "Starting collision query benchmark with " << total_individual_queries << " individual queries..." << std::endl;
+            
+            size_t total_queries = 0;
+            size_t total_collisions = 0;
+            
+            // Determine SIMD vector size
+            constexpr size_t SIMD_WIDTH = 4;
+            
+            // Start timing
+            auto start_time = std::chrono::steady_clock::now();
+        
+            // Process individual queries in SIMD-sized batches
+            for (size_t i = 0; i < total_individual_queries; i += SIMD_WIDTH) {
+                const size_t remaining = std::min(SIMD_WIDTH, total_individual_queries - i);
+                
+                // Prepare SIMD vectors for centers (SoA format) and radii
+                std::array<FVectorT, 3> centers;
+                FVectorT radii;
+                
+                // Load data into SIMD vectors in SoA format
+                for (size_t j = 0; j < remaining; ++j) {
+                    centers[0][j] = all_x_coords[i + j];  // X coordinates
+                    centers[1][j] = all_y_coords[i + j];  // Y coordinates  
+                    centers[2][j] = all_z_coords[i + j];  // Z coordinates
+                    radii[j] = all_radii[i + j];          // Radii
+                }
+                
+                // Perform SIMD collision detection
+                bool collision_result = collides_simd(centers, radii);
+                
+                // Count collisions
+                if (collision_result) {
+                    total_collisions++;
+                }
+                
+                total_queries += remaining;
+            }
+            
+            // End timing
+            auto end_time = std::chrono::steady_clock::now();
+            auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time);
+            
+            // Output benchmark results
+            std::cout << "=== Collision Query Benchmark Results ===" << std::endl;
+            std::cout << "Total batches processed: " << num_batches << std::endl;
+            std::cout << "Total queries processed: " << total_queries << std::endl;
+            std::cout << "Total collisions detected: " << total_collisions << std::endl;
+            std::cout << "Total execution time: " << duration.count() << " nanoseconds" << std::endl;
+            std::cout << "Average time per query: " << (total_queries > 0 ? duration.count() / total_queries : 0) << " nanoseconds" << std::endl;
+
+            std::cout << "Collision rate: " << (total_queries > 0 ? (100.0 * total_collisions) / total_queries : 0) << "%" << std::endl;
+            
+            // Log to file
+            std::ofstream log_file("scripts/log/benchmark_results.txt", std::ios::app);
+            if (log_file.is_open()) {
+                std::cout << "log_file is open" << std::endl;
+                log_file << "=== MVT Collision Checking Benchamrk ===" << std::endl
+                        << "Batches: " << num_batches << ", Queries: " << total_queries 
+                        << ", Collisions: " << total_collisions 
+                        << ", Time: " << duration.count() << " nanoseconds"
+                        << ", Avg: " << (total_queries > 0 ? duration.count() / total_queries : 0) << " nanoseconds" 
+                        << std::endl;
+                log_file.close();
+            }
+        }
+        
+        // Print structure of the multilevel voxel table
         void print_grid_structure(std::ostream& os = std::cout) const {
             os << "=== Level Hashing Grid Structure ===" << std::endl;
             os << "Workspace bounds: [" 
@@ -591,6 +788,8 @@ namespace vamp::collision
                << ", " << max_query_radius << "]" << std::endl;
             os << "Point radius: " << point_radius << std::endl;
             os << "Inverse scale factor: " << inverse_scale_factor << std::endl;
+            os << "Grid width: " << grid_width << std::endl;
+            os << " # of voxels: " << grid_width * grid_width * grid_width << std::endl;
             os << std::endl;
 
             // Count statistics
@@ -773,6 +972,8 @@ namespace vamp::collision
                 os << "Overhead ratio: " << std::fixed << std::setprecision(2) << overhead_ratio 
                 << " (hash tables / point data)" << std::endl;
             }
+            os << "Coordinate Pool: " << point_coord_pool_size * sizeof(float) << std::endl;
+            os << "Index Array Pool: " << index_pool_size * sizeof(uint8_t) << std::endl;
         }
 
         // Print detailed voxel contents for a specific region
@@ -830,9 +1031,6 @@ namespace vamp::collision
             }
         }
 
-        ~MVT() = default;
-
-    private:
         void initialize_memory_pool() {        
             // 1. Estimate max # points per voxel
             //    Here we assume distance between points is 2 cm 
