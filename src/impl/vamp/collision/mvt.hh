@@ -17,29 +17,43 @@
 #include <vamp/collision/math.hh>
 #include <vamp/vector.hh>
 
-#define ALIGN_TO_SIMD_WIDTH(value) ((((value) + FVectorT::num_scalars - 1) / FVectorT::num_scalars) * FVectorT::num_scalars)
-#define ALIGN_TO_CACHE_LINE(value) ((((value) + 64 - 1) / 64) * 64)
-
 namespace vamp::collision
 {
+    /**
+     * Multi-level Voxel Table (MVT) - A hierarchical spatial data structure
+     * for efficient collision detection using a three-level sparse table.
+     * 
+     * Assumption: all points to be inserted to MVT is in the given workspace bounds 
+     */
     struct MVT
     {
+        // ====================================================================
+        // TYPE DEFINITIONS
+        // ====================================================================
+        
         using FVectorT = FloatVector<>;
         using IVectorT = IntVector<>;
+        using VoxelIndex = uint32_t;
         
-        // Constants
-        static constexpr uint8_t INVALID_INDEX = 255;
-        static constexpr uint8_t MAX_GRID_WIDTH = 255;
+        static constexpr VoxelIndex INVALID_VOXEL_INDEX = std::numeric_limits<VoxelIndex>::max();
+        static constexpr uint16_t MAX_GRID_WIDTH = std::numeric_limits<uint16_t>::max();
+        
+        // Three-level table types
+        using ZLevelTable = uint32_t*;      // Z table: voxel indices
+        using YLevelTable = uint32_t**;     // Y table: pointers to Z tables
+        using XLevelTable = uint32_t***;    // X table: pointers to Y tables
 
+        // ====================================================================
+        // VOXEL STRUCTURE
+        // ====================================================================
+        
         struct alignas(32) Voxel {
-            // Structure-of-Arrays for SIMD efficiency
             float* x_coords = nullptr;
             float* y_coords = nullptr;
             float* z_coords = nullptr;
             size_t point_count = 0;
             size_t capacity = 0;
             
-            // Axis-Aligned Bounding Box bounds
             Point bbox_min = {0.0f, 0.0f, 0.0f};
             Point bbox_max = {0.0f, 0.0f, 0.0f};
             
@@ -63,7 +77,12 @@ namespace vamp::collision
                 y_coords[point_count] = point[1];
                 z_coords[point_count] = point[2];
                 
-                // Update bounding box
+                update_bounding_box(point);
+                ++point_count;
+            }
+
+        private:
+            void update_bounding_box(const Point& point) {
                 if (point_count == 0) {
                     bbox_min = bbox_max = point;
                 } else {
@@ -74,82 +93,57 @@ namespace vamp::collision
                     bbox_max[1] = std::max(bbox_max[1], point[1]);
                     bbox_max[2] = std::max(bbox_max[2], point[2]);
                 }
-                ++point_count;
             }
         };
 
-        // Three-level voxel table
-        struct ZLevelTable {
-            std::vector<Voxel> voxels;
-            uint8_t* z_coord_to_voxel_idx = nullptr;
-            
-            void initialize_with_pool(uint8_t* idx_ptr, uint8_t array_len) {
-                z_coord_to_voxel_idx = idx_ptr;
-                std::fill(z_coord_to_voxel_idx, z_coord_to_voxel_idx + array_len, INVALID_INDEX);
-            }
-        };
+        // ====================================================================
+        // MEMBER VARIABLES
+        // ====================================================================
         
-        struct YLevelTable {
-            std::vector<ZLevelTable> z_tables;
-            uint8_t* y_coord_to_z_table_idx = nullptr;
-            
-            void initialize_with_pool(uint8_t* idx_ptr, uint8_t array_len) {
-                y_coord_to_z_table_idx = idx_ptr;
-                std::fill(y_coord_to_z_table_idx, y_coord_to_z_table_idx + array_len, INVALID_INDEX);
-            }
-        };
-
-        struct XLevelTable {
-            std::vector<YLevelTable> y_tables;
-            uint8_t* x_coord_to_y_table_idx = nullptr;
-            
-            void initialize_with_pool(uint8_t* idx_ptr,uint8_t array_len) {
-                x_coord_to_y_table_idx = idx_ptr;
-                std::fill(x_coord_to_y_table_idx, x_coord_to_y_table_idx + array_len, INVALID_INDEX);
-            }
-        };
-
-        // Member variables
+        // Query parameters
         float min_query_radius;
         float max_query_radius;
         float point_radius;
         
+        // Spatial bounds
         Point workspace_aabb_min;
         Point workspace_aabb_max;
         Point global_aabb_min;
         Point global_aabb_max;
         
+        // Grid configuration
         float inverse_scale_factor;
-        uint8_t grid_width;
-        uint8_t index_array_len;
+        uint16_t grid_width;
+        uint16_t table_array_len;
+        uint16_t z_table_array_len;
         
+        // Memory pools
         std::unique_ptr<float[], decltype(&std::free)> point_coord_pool{nullptr, &std::free};
         size_t point_coord_pool_size = 0;
         size_t point_coord_pool_used = 0;
         size_t estimated_max_point_per_voxel = 0;
-
-        std::unique_ptr<uint8_t[], decltype(&std::free)> index_pool{nullptr, &std::free};
-        size_t index_pool_size = 0;
-        size_t index_pool_used = 0;
-
-        XLevelTable x_level_table;
         
+        std::unique_ptr<void*[], decltype(&std::free)> pointer_array_pool{nullptr, &std::free};
+        size_t pointer_array_pool_size = 0;
+        size_t pointer_array_pool_used = 0;
+        
+        std::unique_ptr<VoxelIndex[], decltype(&std::free)> voxel_index_pool{nullptr, &std::free};
+        size_t voxel_index_pool_size = 0;
+        size_t voxel_index_pool_used = 0;
+
+        // Voxel storage and hierarchy entry
+        std::vector<Voxel> voxel_storage;
+        XLevelTable x_level_table = nullptr;
+        
+        // SIMD-optimized bounds
         FVectorT simd_global_min_x, simd_global_min_y, simd_global_min_z;
         FVectorT simd_global_max_x, simd_global_max_y, simd_global_max_z;
         FVectorT simd_workspace_min_x, simd_workspace_min_y, simd_workspace_min_z;
 
-        // Construct a multilevel voxel grid for spatial queries.
-        //
-        // Parameters:
-        // - points: Collection of 3D points to include in the grid
-        // - min_radius: Minimum radius for collision queries (inclusive)
-        // - max_radius: Maximum radius for collision queries (inclusive)
-        // - workspace_aabb_min: Lower corner of the robot's workspace AABB
-        // - workspace_aabb_max: Upper corner of the robot's workspace AABB
-        // - point_radius: Radius associated with each point in the grid
-        //
-        // Assumption:
-        // - Workspace is cubic
+        // ====================================================================
+        // CONSTRUCTOR & DESTRUCTOR
+        // ====================================================================
+        
         MVT(
             const std::vector<Point>& points,
             const float min_radius,
@@ -164,28 +158,18 @@ namespace vamp::collision
               point_radius{point_radius}
         {
             if (points.empty()) {
-                global_aabb_min = Point{std::numeric_limits<float>::max(), 
-                                        std::numeric_limits<float>::max(), 
-                                        std::numeric_limits<float>::max()};
-                global_aabb_max = Point{std::numeric_limits<float>::lowest(), 
-                                        std::numeric_limits<float>::lowest(), 
-                                        std::numeric_limits<float>::lowest()};
+                initialize_empty_bounds();
                 return;
             }
             
-            initialize_memory_pool();       
+            configure_grid();
+            initialize_memory_pools();
             build_spatial_grid(points);
             compute_global_bounds();
             setup_simd_vectors();
-
-            // std::ofstream log_file("scripts/log/tmp.txt");
-            // print_grid_structure(log_file);
-            // print_voxel_details(0, 255, 0, 255, 0, 255, log_file);
-            // benchmark_collision_queries("../cc_queries_mvt.txt");
         }
 
-        // Copy constructor
-        MVT(const MVT& other) 
+        MVT(const MVT& other)
             : min_query_radius(other.min_query_radius),
               max_query_radius(other.max_query_radius),
               point_radius(other.point_radius),
@@ -195,93 +179,74 @@ namespace vamp::collision
               global_aabb_max(other.global_aabb_max),
               inverse_scale_factor(other.inverse_scale_factor),
               grid_width(other.grid_width),
-              index_array_len(other.index_array_len),
+              table_array_len(other.table_array_len),
+              z_table_array_len(other.z_table_array_len),
               point_coord_pool_size(other.point_coord_pool_size),
               point_coord_pool_used(other.point_coord_pool_used),
               estimated_max_point_per_voxel(other.estimated_max_point_per_voxel),
-              index_pool_size(other.index_pool_size),
-              index_pool_used(other.index_pool_used) 
-        {   
-            copy_memory_pool(other);
- 
-            x_level_table = other.x_level_table;
-            
-            // Update pointers in voxels to point to new pool
-            update_voxel_pointers_after_copy(other);
+              pointer_array_pool_size(other.pointer_array_pool_size),
+              pointer_array_pool_used(other.pointer_array_pool_used),
+              voxel_index_pool_size(other.voxel_index_pool_size),
+              voxel_index_pool_used(other.voxel_index_pool_used),
+              voxel_storage(other.voxel_storage)
+        {
+            copy_memory_pools(other);
+            update_pointers_after_copy(other);
             setup_simd_vectors();
         }
 
-        // Copy assignment
-        MVT& operator=(const MVT& other) {
-            if (this != &other) {
-                MVT temp(other);  // copy constructor
-                *this = std::move(temp);  // move assignment
-            }
-            return *this;
-        }
+        ~MVT() = default;
 
-        // Test whether a sphere centered at 'center' with radius 'radius' collides with any
-        // point in this grid.
-        // Returns true if in collision, false otherwise.
+        // ====================================================================
+        // COLLISION DETECTION
+        // ====================================================================
+        
+        // Scalar collision detection
         [[nodiscard]] auto collides(const Point& center, float radius) const noexcept -> bool
         {
-            // Calculate the expanded query radius (sphere radius + point radius)
             const float query_radius = radius + point_radius;
+            const float query_radius_squared = query_radius * query_radius;
 
-            // Check if query sphere overlaps with global AABB
+            // Early exit: Global AABB check
             if (center[0] + query_radius < global_aabb_min[0] ||
                 center[0] - query_radius > global_aabb_max[0] ||
                 center[1] + query_radius < global_aabb_min[1] ||
                 center[1] - query_radius > global_aabb_max[1] ||
                 center[2] + query_radius < global_aabb_min[2] ||
                 center[2] - query_radius > global_aabb_max[2]) {
-                return false; // No collision possible
+                return false;
             }
 
-            const float query_radius_squared = query_radius * query_radius;
-                
-            const float grid_query_radius = query_radius * inverse_scale_factor;
+            // Compute grid space coordinates and query bounds
+            const float grid_query_radius = std::min(1.0f, query_radius * inverse_scale_factor);
             const float grid_center_x_float = (center[0] - workspace_aabb_min[0]) * inverse_scale_factor;
             const float grid_center_y_float = (center[1] - workspace_aabb_min[1]) * inverse_scale_factor;
             const float grid_center_z_float = (center[2] - workspace_aabb_min[2]) * inverse_scale_factor;
             
-            // Calculate actual sphere bounds in grid space
-            const int min_x_touched = static_cast<int>(grid_center_x_float - grid_query_radius);
-            const int max_x_touched = static_cast<int>(grid_center_x_float + grid_query_radius);
-            const int min_y_touched = static_cast<int>(grid_center_y_float - grid_query_radius);
-            const int max_y_touched = static_cast<int>(grid_center_y_float + grid_query_radius);
-            const int min_z_touched = static_cast<int>(grid_center_z_float - grid_query_radius);
-            const int max_z_touched = static_cast<int>(grid_center_z_float + grid_query_radius);
+            //Calculate voxel iteration bounds
+            const uint16_t min_x = static_cast<uint16_t>(std::max(0.0f, (grid_center_x_float - grid_query_radius)));
+            const uint16_t max_x = static_cast<uint16_t>(std::min(static_cast<float>(grid_width - 1), (grid_center_x_float + grid_query_radius)));
+            const uint16_t min_y = static_cast<uint16_t>(std::max(0.0f, (grid_center_y_float - grid_query_radius)));
+            const uint16_t max_y = static_cast<uint16_t>(std::min(static_cast<float>(grid_width - 1), (grid_center_y_float + grid_query_radius)));
+            const uint16_t min_z = static_cast<uint16_t>(std::max(0.0f, (grid_center_z_float - grid_query_radius)));
+            const uint16_t max_z = static_cast<uint16_t>(std::min(static_cast<float>(grid_width - 1), (grid_center_z_float + grid_query_radius)));
 
-            // Determine voxel bounds to check (at most 26-neighborhood)
-            const int min_x = std::max({0, min_x_touched, static_cast<int>(grid_center_x_float) - 1});
-            const int max_x = std::min({254, max_x_touched, static_cast<int>(grid_center_x_float) + 1});
-            const int min_y = std::max({0, min_y_touched, static_cast<int>(grid_center_y_float) - 1});
-            const int max_y = std::min({254, max_y_touched, static_cast<int>(grid_center_y_float) + 1});
-            const int min_z = std::max({0, min_z_touched, static_cast<int>(grid_center_z_float) - 1});
-            const int max_z = std::min({254, max_z_touched, static_cast<int>(grid_center_z_float) + 1});
-
-
-            // Iterate through potentially overlapping voxels
-            for (int voxel_x = min_x; voxel_x <= max_x; ++voxel_x) {
-                const uint8_t y_level_index = x_level_table.x_coord_to_y_table_idx[voxel_x];
-                if (y_level_index == INVALID_INDEX) continue;
+            // Traverse three-level spatial hierarchy
+            for (uint16_t voxel_x = min_x; voxel_x <= max_x; ++voxel_x) {
+                YLevelTable y_level_table = x_level_table[voxel_x];
+                if (y_level_table == nullptr) continue;
                 
-                const auto& y_level_table = x_level_table.y_tables[y_level_index];
-                
-                for (int voxel_y = min_y; voxel_y <= max_y; ++voxel_y) {
-                    const uint8_t z_level_index = y_level_table.y_coord_to_z_table_idx[voxel_y];
-                    if (z_level_index == INVALID_INDEX) continue;
+                for (uint16_t voxel_y = min_y; voxel_y <= max_y; ++voxel_y) {
+                    ZLevelTable z_level_table = y_level_table[voxel_y];
+                    if (z_level_table == nullptr) continue;
                     
-                    const auto& z_level_table = y_level_table.z_tables[z_level_index];
-                    
-                    for (int voxel_z = min_z; voxel_z <= max_z; ++voxel_z) {
-                        const uint8_t voxel_index = z_level_table.z_coord_to_voxel_idx[voxel_z];
-                        if (voxel_index == INVALID_INDEX) continue;
+                    for (uint16_t voxel_z = min_z; voxel_z <= max_z; ++voxel_z) {
+                        VoxelIndex voxel_index = z_level_table[voxel_z];
+                        if (voxel_index == INVALID_VOXEL_INDEX) continue;
                         
-                        const auto& voxel = z_level_table.voxels[voxel_index];
+                        const Voxel& voxel = voxel_storage[voxel_index];
                         
-                        // Bounding box check first
+                        // Voxel-level AABB culling
                         if (center[0] + query_radius < voxel.bbox_min[0] ||
                             center[0] - query_radius > voxel.bbox_max[0] ||
                             center[1] + query_radius < voxel.bbox_min[1] ||
@@ -291,7 +256,7 @@ namespace vamp::collision
                             continue;
                         }
                         
-                        // Check each point in the voxel
+                        // Point-level collision detection
                         const size_t num_points = voxel.point_count;
                         for (size_t i = 0; i < num_points; ++i) {
                             const float dx = center[0] - voxel.x_coords[i];
@@ -300,34 +265,27 @@ namespace vamp::collision
                             const float distance_squared = dx * dx + dy * dy + dz * dz;
                             
                             if (distance_squared <= query_radius_squared) {
-                                return true; // Collision detected
+                                return true;
                             }
                         }
                     }
                 }
             }
-            return false; // No collision
+            
+            return false;
         }
 
-        // Determine whether any of a set of spheres collides with a point in this grid.
-        //
-        // Template parameters:
-        // - FVectorT: Type of a SIMD vector of floats
-        // - IVectorT: Type of a SIMD vector of integer indexes
-        //
-        // Parameters:
-        // - centers: (x, y, z) struct-of-arrays of the centers of each sphere
-        // - radii: SIMD vector of the radii of each sphere
+        // SIMD vectorized collision detection for multiple spheres
         auto inline collides_simd(const std::array<FVectorT, 3> &centers, 
-                          FVectorT radii) const noexcept -> bool
+                                FVectorT radii) const noexcept -> bool
         {
             constexpr size_t SIMD_WIDTH = FVectorT::num_scalars;
-    
-            // Broadcast constants to SIMD vectors
+
+            // Compute query radii for all spheres
             const FVectorT point_radius_vec = FVectorT::fill(point_radius);
             const FVectorT query_radii = radii + point_radius_vec;
-  
-            // Global AABB check - if all spheres are outside, no collision possible
+
+            // SIMD global AABB check - cull entire lanes that are completely outside
             const auto outside_x_low = (centers[0] + query_radii) < simd_global_min_x;
             const auto outside_x_high = simd_global_max_x < (centers[0] - query_radii);
             const auto outside_y_low = (centers[1] + query_radii) < simd_global_min_y;
@@ -336,24 +294,21 @@ namespace vamp::collision
             const auto outside_z_high = simd_global_max_z < (centers[2] - query_radii);
             
             const auto outside_mask = outside_x_low | outside_x_high | 
-                                      outside_y_low | outside_y_high | 
-                                      outside_z_low | outside_z_high;
+                                    outside_y_low | outside_y_high | 
+                                    outside_z_low | outside_z_high;
             
             if (outside_mask.all()) {
-                return false;
+                return false;  // All spheres are outside global bounds
             }
             
+            // Transform centers to grid space
             const FVectorT inv_scale = FVectorT::fill(inverse_scale_factor);
-            
-            // Convert centers to grid coordinates (vectorized)
-            const FVectorT grid_center_x = ((centers[0] - simd_workspace_min_x) * inv_scale);
-            const FVectorT grid_center_y = ((centers[1] - simd_workspace_min_y) * inv_scale);
-            const FVectorT grid_center_z = ((centers[2] - simd_workspace_min_z) * inv_scale);
-
+            const FVectorT grid_center_x = (centers[0] - simd_workspace_min_x) * inv_scale;
+            const FVectorT grid_center_y = (centers[1] - simd_workspace_min_y) * inv_scale;
+            const FVectorT grid_center_z = (centers[2] - simd_workspace_min_z) * inv_scale;
             const auto query_radii_squared = query_radii * query_radii;
 
-            // For each sphere that's not completely outside, do detailed collision check
-            // Extract individual spheres for detailed checking
+            // Extract scalar arrays for per-sphere processing
             const auto centers_x_array = centers[0].to_array();
             const auto centers_y_array = centers[1].to_array();
             const auto centers_z_array = centers[2].to_array();
@@ -364,57 +319,46 @@ namespace vamp::collision
             const auto grid_y_array = grid_center_y.to_array();
             const auto grid_z_array = grid_center_z.to_array();
             
-            for (size_t i = 0; i < SIMD_WIDTH; ++i) {
-                // Skip spheres that are completely outside global AABB
-                if (outside_array[i] != 0) {
+            // Process each sphere individually
+            for (size_t sphere_idx = 0; sphere_idx < SIMD_WIDTH; ++sphere_idx) {
+                // Skip spheres that failed global AABB test
+                if (outside_array[sphere_idx] != 0) {
                     continue;
                 }
                 
-                const Point center = {centers_x_array[i], centers_y_array[i], centers_z_array[i]};
-                const float query_radius = query_radii_array[i];
-                const float query_radius_squared = query_radii_squared_array[i];
-                const float grid_query_radius = query_radii_array[i] * inverse_scale_factor;
-
-                const float grid_center_x_float = grid_x_array[i];
-                const float grid_center_y_float = grid_y_array[i];
-                const float grid_center_z_float = grid_z_array[i];
+                // Extract sphere parameters
+                const Point center = {centers_x_array[sphere_idx], centers_y_array[sphere_idx], centers_z_array[sphere_idx]};
+                const float query_radius = query_radii_array[sphere_idx];
+                const float query_radius_squared = query_radii_squared_array[sphere_idx];
+                const float grid_query_radius = std::min(1.0f, query_radius * inverse_scale_factor);
+                const float grid_center_x_float = grid_x_array[sphere_idx];
+                const float grid_center_y_float = grid_y_array[sphere_idx];
+                const float grid_center_z_float = grid_z_array[sphere_idx];
                 
-                // Calculate actual sphere bounds in grid space
-                const int min_x_touched = static_cast<int>(grid_center_x_float - grid_query_radius);
-                const int max_x_touched = static_cast<int>(grid_center_x_float + grid_query_radius);
-                const int min_y_touched = static_cast<int>(grid_center_y_float - grid_query_radius);
-                const int max_y_touched = static_cast<int>(grid_center_y_float + grid_query_radius);
-                const int min_z_touched = static_cast<int>(grid_center_z_float - grid_query_radius);
-                const int max_z_touched = static_cast<int>(grid_center_z_float + grid_query_radius);
+                // Calculate voxel iteration bounds for this sphere
+                const uint16_t min_x = static_cast<uint16_t>(std::max(0.0f, (grid_center_x_float - grid_query_radius)));
+                const uint16_t max_x = static_cast<uint16_t>(std::min(static_cast<float>(grid_width - 1), (grid_center_x_float + grid_query_radius)));
+                const uint16_t min_y = static_cast<uint16_t>(std::max(0.0f, (grid_center_y_float - grid_query_radius)));
+                const uint16_t max_y = static_cast<uint16_t>(std::min(static_cast<float>(grid_width - 1), (grid_center_y_float + grid_query_radius)));
+                const uint16_t min_z = static_cast<uint16_t>(std::max(0.0f, (grid_center_z_float - grid_query_radius)));
+                const uint16_t max_z = static_cast<uint16_t>(std::min(static_cast<float>(grid_width - 1), (grid_center_z_float + grid_query_radius)));
 
-                // Determine voxel bounds to check
-                const int min_x = std::max({0, min_x_touched, static_cast<int>(grid_center_x_float) - 1});
-                const int max_x = std::min({254, max_x_touched, static_cast<int>(grid_center_x_float) + 1});
-                const int min_y = std::max({0, min_y_touched, static_cast<int>(grid_center_y_float) - 1});
-                const int max_y = std::min({254, max_y_touched, static_cast<int>(grid_center_y_float) + 1});
-                const int min_z = std::max({0, min_z_touched, static_cast<int>(grid_center_z_float) - 1});
-                const int max_z = std::min({254, max_z_touched, static_cast<int>(grid_center_z_float) + 1});
-
-                // Check voxels in the neighborhood
-                for (int voxel_x = min_x; voxel_x <= max_x; ++voxel_x) {
-                    const uint8_t y_level_index = x_level_table.x_coord_to_y_table_idx[voxel_x];
-                    if (y_level_index == INVALID_INDEX) continue;
+                // Traverse spatial hierarchy for this sphere
+                for (uint16_t voxel_x = min_x; voxel_x <= max_x; ++voxel_x) {
+                    YLevelTable y_level_table = x_level_table[voxel_x];
+                    if (y_level_table == nullptr) continue;
                     
-                    const auto& y_level_table = x_level_table.y_tables[y_level_index];
-                    
-                    for (int voxel_y = min_y; voxel_y <= max_y; ++voxel_y) {
-                        const uint8_t z_level_index = y_level_table.y_coord_to_z_table_idx[voxel_y];
-                        if (z_level_index == INVALID_INDEX) continue;
+                    for (uint16_t voxel_y = min_y; voxel_y <= max_y; ++voxel_y) {
+                        ZLevelTable z_level_table = y_level_table[voxel_y];
+                        if (z_level_table == nullptr) continue;
                         
-                        const auto& z_level_table = y_level_table.z_tables[z_level_index];
-                        
-                        for (int voxel_z = min_z; voxel_z <= max_z; ++voxel_z) {
-                            const uint8_t voxel_index = z_level_table.z_coord_to_voxel_idx[voxel_z];
-                            if (voxel_index == INVALID_INDEX) continue;
+                        for (uint16_t voxel_z = min_z; voxel_z <= max_z; ++voxel_z) {
+                            VoxelIndex voxel_index = z_level_table[voxel_z];
+                            if (voxel_index == INVALID_VOXEL_INDEX) continue;
                             
-                            const auto& voxel = z_level_table.voxels[voxel_index];
+                            const Voxel& voxel = voxel_storage[voxel_index];
                             
-                            // Voxel bounding box check
+                            // Voxel-level AABB culling
                             if (center[0] + query_radius < voxel.bbox_min[0] ||
                                 center[0] - query_radius > voxel.bbox_max[0] ||
                                 center[1] + query_radius < voxel.bbox_min[1] ||
@@ -424,140 +368,39 @@ namespace vamp::collision
                                 continue;
                             }
                             
+                            // SIMD point-level collision detection
                             const size_t num_points = voxel.point_count;
                             const auto* x_coords = voxel.x_coords;
                             const auto* y_coords = voxel.y_coords;
                             const auto* z_coords = voxel.z_coords;
 
-                            // Option1 : Always do SIMD point-by-point collision check within this voxel
-                            // Broadcast sphere center and radius for SIMD comparison
                             const FVectorT sphere_x = FVectorT::fill(center[0]);
                             const FVectorT sphere_y = FVectorT::fill(center[1]);
                             const FVectorT sphere_z = FVectorT::fill(center[2]);
                             const FVectorT sphere_radius_sq = FVectorT::fill(query_radius_squared);
 
                             // Process points in SIMD chunks
-                            size_t point_idx = 0;
-                            // Process all points including zero padding with SIMD
-                            for (; point_idx < num_points; point_idx += SIMD_WIDTH) {
-                                // Load point coordinates
-                                const FVectorT point_x(x_coords + point_idx); // aligned load
+                            for (size_t point_idx = 0; point_idx < num_points; point_idx += SIMD_WIDTH) {
+                                const FVectorT point_x(x_coords + point_idx);
                                 const FVectorT point_y(y_coords + point_idx);
                                 const FVectorT point_z(z_coords + point_idx);
                                 
-                                // Calculate squared distances
                                 const FVectorT dx = sphere_x - point_x;
                                 const FVectorT dy = sphere_y - point_y;
                                 const FVectorT dz = sphere_z - point_z;
                                 const FVectorT dist_sq = dx * dx + dy * dy + dz * dz;
                                 
-                                // Check for collision
                                 const auto collision_mask = dist_sq <= sphere_radius_sq;
                                 if (collision_mask.any()) {
-                                    return true; // Collision detected
+                                    return true;
                                 }
                             }
-
-                            // // Option 2: Hybrid
-                            // // Hot path: optimize for voxels with few points (median is 3)
-                            // if (num_points <= 4) {
-                            //     // Scalar code with manual unrolling
-                            //     const float cx = center[0];
-                            //     const float cy = center[1];
-                            //     const float cz = center[2];
-                                
-                            //     // Fully unrolled for common cases
-                            //     switch (num_points) {
-                            //         case 1: {
-                            //             const float dx = cx - x_coords[0];
-                            //             const float dy = cy - y_coords[0];
-                            //             const float dz = cz - z_coords[0];
-                            //             if (dx*dx + dy*dy + dz*dz <= query_radius_squared) return true;
-                            //             break;
-                            //         }
-                            //         case 2: {
-                            //             const float dx0 = cx - x_coords[0];
-                            //             const float dy0 = cy - y_coords[0];
-                            //             const float dz0 = cz - z_coords[0];
-                            //             if (dx0*dx0 + dy0*dy0 + dz0*dz0 <= query_radius_squared) return true;
-                                        
-                            //             const float dx1 = cx - x_coords[1];
-                            //             const float dy1 = cy - y_coords[1];
-                            //             const float dz1 = cz - z_coords[1];
-                            //             if (dx1*dx1 + dy1*dy1 + dz1*dz1 <= query_radius_squared) return true;
-                            //             break;
-                            //         }
-                            //         case 3: {
-                            //             const float dx0 = cx - x_coords[0];
-                            //             const float dy0 = cy - y_coords[0];
-                            //             const float dz0 = cz - z_coords[0];
-                            //             if (dx0*dx0 + dy0*dy0 + dz0*dz0 <= query_radius_squared) return true;
-                                        
-                            //             const float dx1 = cx - x_coords[1];
-                            //             const float dy1 = cy - y_coords[1];
-                            //             const float dz1 = cz - z_coords[1];
-                            //             if (dx1*dx1 + dy1*dy1 + dz1*dz1 <= query_radius_squared) return true;
-                                        
-                            //             const float dx2 = cx - x_coords[2];
-                            //             const float dy2 = cy - y_coords[2];
-                            //             const float dz2 = cz - z_coords[2];
-                            //             if (dx2*dx2 + dy2*dy2 + dz2*dz2 <= query_radius_squared) return true;
-                            //             break;
-                            //         }
-                            //         case 4: {
-                            //             // Process 4 points
-                            //             for (size_t i = 0; i < 4; ++i) {
-                            //                 const float dx = cx - x_coords[i];
-                            //                 const float dy = cy - y_coords[i];
-                            //                 const float dz = cz - z_coords[i];
-                            //                 if (dx*dx + dy*dy + dz*dz <= query_radius_squared) return true;
-                            //             }
-                            //             break;
-                            //         }
-                            //     }
-                            // } else {
-                            //     // Use SIMD for larger voxels (5+ points)
-                            //     const FVectorT sphere_x = FVectorT::fill(center[0]);
-                            //     const FVectorT sphere_y = FVectorT::fill(center[1]);
-                            //     const FVectorT sphere_z = FVectorT::fill(center[2]);
-                            //     const FVectorT sphere_radius_sq = FVectorT::fill(query_radius_squared);
-
-                            //     size_t point_idx = 0;
-                            //     constexpr size_t SIMD_MASK = ~(SIMD_WIDTH - 1);
-                            //     const size_t num_points_aligned = (num_points + SIMD_WIDTH - 1) & SIMD_MASK;
-
-                            //     for (; point_idx < num_points_aligned; point_idx += SIMD_WIDTH) {
-                            //         const FVectorT point_x(x_coords + point_idx);
-                            //         const FVectorT point_y(y_coords + point_idx);
-                            //         const FVectorT point_z(z_coords + point_idx);
-                                    
-                            //         const FVectorT dx = sphere_x - point_x;
-                            //         const FVectorT dy = sphere_y - point_y;
-                            //         const FVectorT dz = sphere_z - point_z;
-                            //         const FVectorT dist_sq = dx * dx + dy * dy + dz * dz;
-                                    
-                            //         const auto collision_mask = dist_sq <= sphere_radius_sq;
-                            //         if (collision_mask.any()) {
-                            //             return true;
-                            //         }
-                            //     }
-                            // }
-
-                            // // Option 3: Do serial collision checking
-                            // size_t point_idx = 0; 
-                            // for (; point_idx < num_points; ++point_idx) {
-                            //     const float dx = center[0] - x_coords[point_idx];
-                            //     const float dy = center[1] - y_coords[point_idx];
-                            //     const float dz = center[2] - z_coords[point_idx];
-
-                            //     if (dx * dx + dy * dy + dz * dz <= query_radius_squared) {
-                            //         return true; // Collision detected
-                            //     }
-                            // }
                         }
                     }
                 }
             }
+            
+            return false;
 
             // // Call serial collision checking
             // constexpr size_t SIMD_WIDTH = FVectorT::num_scalars;
@@ -565,551 +408,108 @@ namespace vamp::collision
             // const auto centers_y = centers[1].to_array();
             // const auto centers_z = centers[2].to_array();
             // const auto radiivec = radii.to_array();
-            
+
             // for (size_t i = 0; i < SIMD_WIDTH; ++i) {
             //     Point center = {centers_x[i], centers_y[i], centers_z[i]};
             //     float radius = radiivec[i];
-                
+
             //     if (collides(center, radius)) {
             //         return true; // Early exit if any sphere collides
             //     }
             // }
-            
-            return false; // No collisions detected
-        }
 
-        ~MVT() = default;
+            // return false; // No collisions detected
+        }
 
     private:
-        struct QueryData {
-            std::vector<std::vector<float>> x_coords;
-            std::vector<std::vector<float>> y_coords;
-            std::vector<std::vector<float>> z_coords;
-            std::vector<std::vector<float>> radii;
-        };
+        // ====================================================================
+        // INITIALIZATION HELPERS
+        // ====================================================================
         
-        // Parse query data from text file
-        bool loadQueries(const std::string& filename, QueryData& queries) {
-            std::ifstream file(filename);
-            if (!file.is_open()) {
-                std::cerr << "Error: Cannot open query file: " << filename << std::endl;
-                return false;
-            }
-        
-            queries.x_coords.clear();
-            queries.y_coords.clear();
-            queries.z_coords.clear();
-            queries.radii.clear();
-        
-            std::string line;
-            while (std::getline(file, line)) {
-                // Parse line format: [ [x values] ] [ [y values] ] [ [z values] ] [ [radii] ]
-                std::vector<std::vector<float>> line_data(4);
-                
-                std::istringstream iss(line);
-                std::string token;
-                int array_idx = 0;
-                
-                while (iss >> token && array_idx < 4) {
-                    if (token == "[") {
-                        // Skip opening bracket
-                        continue;
-                    } else if (token == "]") {
-                        array_idx++;
-                        continue;
-                    } else if (token.front() == '[' && token.back() != ']') {
-                        // Start of array, remove opening bracket
-                        token = token.substr(1);
-                    }
-                    
-                    // Clean up token (remove commas, brackets)
-                    token.erase(std::remove(token.begin(), token.end(), ','), token.end());
-                    if (token.back() == ']') {
-                        token.pop_back();
-                    }
-                    
-                    if (!token.empty()) {
-                        try {
-                            float value = std::stof(token);
-                            line_data[array_idx].push_back(value);
-                        } catch (const std::exception& e) {
-                            // Skip invalid tokens
-                        }
-                    }
-                }
-                
-                if (!line_data[0].empty()) {
-                    queries.x_coords.push_back(line_data[0]);
-                    queries.y_coords.push_back(line_data[1]);
-                    queries.z_coords.push_back(line_data[2]);
-                    queries.radii.push_back(line_data[3]);
-                }
-            }
+        void initialize_empty_bounds() {
+            constexpr float max_val = std::numeric_limits<float>::max();
+            constexpr float min_val = std::numeric_limits<float>::lowest();
             
-            file.close();
-            // std::cout << "Loaded " << queries.x_coords.size() << " query sets from " << filename << std::endl;
-            return true;
-        }
-        
-        void benchmark_collision_queries(const std::string& query_file) noexcept {
-            // Load query data from file
-            QueryData queries;
-            if (!loadQueries(query_file, queries)) {
-                std::cerr << "Failed to load queries from: " << query_file << std::endl;
-                return;
-            }
-            
-            if (queries.x_coords.empty()) {
-                std::cerr << "No valid queries loaded from file" << std::endl;
-                return;
-            }
-            
-            // Validate that all coordinate arrays have the same size
-            const size_t num_batches = queries.x_coords.size();
-            std::cout << "num_batches = " << num_batches << std::endl;
-            if (queries.y_coords.size() != num_batches || 
-                queries.z_coords.size() != num_batches || 
-                queries.radii.size() != num_batches) {
-                std::cerr << "Error: Inconsistent batch sizes in query data" << std::endl;
-                return;
-            }
-            
-            // Flatten all queries into single vectors
-            std::vector<float> all_x_coords;
-            std::vector<float> all_y_coords;
-            std::vector<float> all_z_coords;
-            std::vector<float> all_radii;
-            
-            for (size_t batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
-                const auto& x_batch = queries.x_coords[batch_idx];
-                const auto& y_batch = queries.y_coords[batch_idx];
-                const auto& z_batch = queries.z_coords[batch_idx];
-                const auto& r_batch = queries.radii[batch_idx];
-                
-                // Validate batch consistency
-                const size_t batch_size = x_batch.size();
-                if (y_batch.size() != batch_size || 
-                    z_batch.size() != batch_size || 
-                    r_batch.size() != batch_size) {
-                    std::cerr << "Warning: Inconsistent sizes in batch " << batch_idx << ", skipping..." << std::endl;
-                    continue;
-                }
-                
-                // Append individual queries to flattened vectors
-                all_x_coords.insert(all_x_coords.end(), x_batch.begin(), x_batch.end());
-                all_y_coords.insert(all_y_coords.end(), y_batch.begin(), y_batch.end());
-                all_z_coords.insert(all_z_coords.end(), z_batch.begin(), z_batch.end());
-                all_radii.insert(all_radii.end(), r_batch.begin(), r_batch.end());
-            }
-            
-            const size_t total_individual_queries = all_x_coords.size();
-            if (total_individual_queries == 0) {
-                std::cerr << "No valid individual queries found" << std::endl;
-                return;
-            }
-            
-            std::cout << "Starting collision query benchmark with " << total_individual_queries << " individual queries..." << std::endl;
-            
-            size_t total_queries = 0;
-            size_t total_collisions = 0;
-            
-            // Determine SIMD vector size
-            constexpr size_t SIMD_WIDTH = 4;
-            
-            // Start timing
-            auto start_time = std::chrono::steady_clock::now();
-        
-            // Process individual queries in SIMD-sized batches
-            for (size_t i = 0; i < total_individual_queries; i += SIMD_WIDTH) {
-                const size_t remaining = std::min(SIMD_WIDTH, total_individual_queries - i);
-                
-                // Prepare SIMD vectors for centers (SoA format) and radii
-                std::array<FVectorT, 3> centers;
-                FVectorT radii;
-                
-                // Load data into SIMD vectors in SoA format
-                for (size_t j = 0; j < remaining; ++j) {
-                    centers[0][j] = all_x_coords[i + j];  // X coordinates
-                    centers[1][j] = all_y_coords[i + j];  // Y coordinates  
-                    centers[2][j] = all_z_coords[i + j];  // Z coordinates
-                    radii[j] = all_radii[i + j];          // Radii
-                }
-                
-                // Perform SIMD collision detection
-                bool collision_result = collides_simd(centers, radii);
-                
-                // Count collisions
-                if (collision_result) {
-                    total_collisions++;
-                }
-                
-                total_queries += remaining;
-            }
-            
-            // End timing
-            auto end_time = std::chrono::steady_clock::now();
-            auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time);
-            
-            // Output benchmark results
-            std::cout << "=== Collision Query Benchmark Results ===" << std::endl;
-            std::cout << "Total batches processed: " << num_batches << std::endl;
-            std::cout << "Total queries processed: " << total_queries << std::endl;
-            std::cout << "Total collisions detected: " << total_collisions << std::endl;
-            std::cout << "Total execution time: " << duration.count() << " nanoseconds" << std::endl;
-            std::cout << "Average time per query: " << (total_queries > 0 ? duration.count() / total_queries : 0) << " nanoseconds" << std::endl;
-
-            std::cout << "Collision rate: " << (total_queries > 0 ? (100.0 * total_collisions) / total_queries : 0) << "%" << std::endl;
-            
-            // Log to file
-            std::ofstream log_file("scripts/log/benchmark_results.txt", std::ios::app);
-            if (log_file.is_open()) {
-                std::cout << "log_file is open" << std::endl;
-                log_file << "=== MVT Collision Checking Benchamrk ===" << std::endl
-                        << "Batches: " << num_batches << ", Queries: " << total_queries 
-                        << ", Collisions: " << total_collisions 
-                        << ", Time: " << duration.count() << " nanoseconds"
-                        << ", Avg: " << (total_queries > 0 ? duration.count() / total_queries : 0) << " nanoseconds" 
-                        << std::endl;
-                log_file.close();
-            }
-        }
-        
-        // Print structure of the multilevel voxel table
-        void print_grid_structure(std::ostream& os = std::cout) const {
-            os << "=== Level Hashing Grid Structure ===" << std::endl;
-            os << "Workspace bounds: [" 
-               << workspace_aabb_min[0] << ", " 
-               << workspace_aabb_min[1] << ", " 
-               << workspace_aabb_min[2] << "] to ["
-               << workspace_aabb_max[0] << ", " 
-               << workspace_aabb_max[1] << ", " 
-               << workspace_aabb_max[2] << "]" << std::endl;
-            os << "Query radius range: [" << min_query_radius 
-               << ", " << max_query_radius << "]" << std::endl;
-            os << "Point radius: " << point_radius << std::endl;
-            os << "Inverse scale factor: " << inverse_scale_factor << std::endl;
-            os << "Grid width: " << grid_width << std::endl;
-            os << " # of voxels: " << grid_width * grid_width * grid_width << std::endl;
-            os << std::endl;
-
-            // Count statistics
-            size_t total_voxels = 0;
-            size_t total_points = 0;
-            size_t non_empty_x_entries = 0;
-            size_t non_empty_y_entries = 0;
-            size_t non_empty_z_entries = 0;
-            
-            // Collect voxel statistics
-            std::vector<size_t> points_per_voxel;
-            
-            // Traverse the three-level structure
-            for (size_t x = 0; x < index_array_len; ++x) {
-                if (x_level_table.x_coord_to_y_table_idx[x] != INVALID_INDEX) {
-                    non_empty_x_entries++;
-                    uint8_t y_level_idx = x_level_table.x_coord_to_y_table_idx[x];
-                    const auto& y_level = x_level_table.y_tables[y_level_idx];
-                    
-                    for (size_t y = 0; y < index_array_len; ++y) {
-                        if (y_level.y_coord_to_z_table_idx[y] != INVALID_INDEX) {
-                            non_empty_y_entries++;
-                            uint8_t z_level_idx = y_level.y_coord_to_z_table_idx[y];
-                            const auto& z_level = y_level.z_tables[z_level_idx];
-                            
-                            for (size_t z = 0; z < index_array_len; ++z) {
-                                if (z_level.z_coord_to_voxel_idx[z] != INVALID_INDEX) {
-                                    non_empty_z_entries++;
-                                    uint8_t voxel_idx = z_level.z_coord_to_voxel_idx[z];
-                                    const auto& voxel = z_level.voxels[voxel_idx];
-                                    size_t voxel_point_count = voxel.point_count;
-                                    
-                                    total_voxels++;
-                                    total_points += voxel_point_count;
-                                    points_per_voxel.push_back(voxel_point_count);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            
-            os << "=== Grid Statistics ===" << std::endl;
-            os << "Total points stored: " << total_points << std::endl;
-            os << "Total voxels: " << total_voxels << std::endl;
-            os << "Non-empty X entries: " << non_empty_x_entries << " / " << (size_t)index_array_len << std::endl;
-            os << "Non-empty Y entries: " << non_empty_y_entries << " (total across all X)" << std::endl;
-            os << "Non-empty Z entries: " << non_empty_z_entries << " (total across all Y)" << std::endl;
-            
-            if (!points_per_voxel.empty()) {
-                // Calculate statistics
-                std::sort(points_per_voxel.begin(), points_per_voxel.end());
-                size_t min_points = points_per_voxel.front();
-                size_t max_points = points_per_voxel.back();
-                double avg_points = static_cast<double>(total_points) / total_voxels;
-                size_t median_points = points_per_voxel[points_per_voxel.size() / 2];
-                
-                os << "\n=== Points per Voxel Statistics ===" << std::endl;
-                os << "Minimum: " << min_points << std::endl;
-                os << "Maximum: " << max_points << std::endl;
-                os << "Average: " << std::fixed << std::setprecision(2) << avg_points << std::endl;
-                os << "Median: " << median_points << std::endl;
-            }
-            os << "\n=== Memory Usage Estimate ===" << std::endl;
-
-            // Calculate actual memory usage including dynamic allocations
-            size_t x_level_table_memory = sizeof(XLevelTable);
-            size_t y_tables_memory = 0;
-            size_t z_tables_memory = 0;
-            size_t voxels_memory = 0;
-            size_t point_data_memory = 0;
-
-            os << "Calculation breakdown:" << std::endl;
-            os << "  Root table struct: " << sizeof(XLevelTable) << " bytes" << std::endl;
-
-            // Memory for root hash table's lookup array (always index_array_len entries)
-            size_t root_lookup_array = index_array_len * sizeof(uint8_t);
-            x_level_table_memory += root_lookup_array;
-            os << "  Root lookup array (" << (size_t)index_array_len << " * " << sizeof(uint8_t) << "): " << root_lookup_array << " bytes" << std::endl;
-
-            // Memory for Y-level tables vector in root
-            size_t root_y_vector = x_level_table.y_tables.capacity() * sizeof(YLevelTable);
-            x_level_table_memory += root_y_vector;
-            os << "  Root Y-tables vector (" << x_level_table.y_tables.capacity() 
-            << " * " << sizeof(YLevelTable) << "): " << root_y_vector << " bytes" << std::endl;
-
-            // Counters for calculation breakdown
-            size_t y_table_count = 0;
-            size_t z_table_count = 0;
-            size_t voxel_count = 0;
-            size_t total_coordinate_capacity = 0;
-
-            // Traverse the three-level structure to calculate actual memory usage
-            for (size_t x = 0; x < index_array_len; ++x) {
-                if (x_level_table.x_coord_to_y_table_idx[x] != INVALID_INDEX) {
-                    uint8_t y_level_idx = x_level_table.x_coord_to_y_table_idx[x];
-                    const auto& y_level = x_level_table.y_tables[y_level_idx];
-                    
-                    // Memory for this Y-level table
-                    y_table_count++;
-                    y_tables_memory += sizeof(YLevelTable);
-                    y_tables_memory += index_array_len * sizeof(uint8_t); // y_coord_to_z_table_idx array
-                    y_tables_memory += y_level.z_tables.capacity() * sizeof(ZLevelTable);
-                    
-                    for (size_t y = 0; y < index_array_len; ++y) {
-                        if (y_level.y_coord_to_z_table_idx[y] != INVALID_INDEX) {
-                            uint8_t z_level_idx = y_level.y_coord_to_z_table_idx[y];
-                            const auto& z_level = y_level.z_tables[z_level_idx];
-                            
-                            // Memory for this Z-level table
-                            z_table_count++;
-                            z_tables_memory += sizeof(ZLevelTable);
-                            z_tables_memory += index_array_len * sizeof(uint8_t); // z_coord_to_voxel_idx array
-                            z_tables_memory += z_level.voxels.capacity() * sizeof(Voxel);
-                            
-                            for (size_t z = 0; z < index_array_len; ++z) {
-                                if (z_level.z_coord_to_voxel_idx[z] != INVALID_INDEX) {
-                                    uint8_t voxel_idx = z_level.z_coord_to_voxel_idx[z];
-                                    const auto& voxel = z_level.voxels[voxel_idx];
-                                    
-                                    // Memory for this voxel's data
-                                    voxel_count++;
-                                    voxels_memory += sizeof(Voxel);
-                                    voxels_memory += 2 * sizeof(Point); // bounding_box_min and max
-                                    
-                                    // Memory for the coordinate vectors
-                                    size_t voxel_coord_capacity = voxel.capacity * 3;
-                                    total_coordinate_capacity += voxel_coord_capacity;
-                                    point_data_memory += voxel_coord_capacity * sizeof(float);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            os << "\nDetailed calculations:" << std::endl;
-            os << "  Y-level tables (" << y_table_count << " tables):" << std::endl;
-            os << "    - Structs: " << y_table_count << " * " << sizeof(YLevelTable) 
-            << " = " << y_table_count * sizeof(YLevelTable) << " bytes" << std::endl;
-            os << "    - Lookup arrays: " << y_table_count << " * " << (size_t)index_array_len << " * " << sizeof(uint8_t)
-            << " = " << y_table_count * index_array_len * sizeof(uint8_t) << " bytes" << std::endl;
-
-            os << "  Z-level tables (" << z_table_count << " tables):" << std::endl;
-            os << "    - Structs: " << z_table_count << " * " << sizeof(ZLevelTable)
-            << " = " << z_table_count * sizeof(ZLevelTable) << " bytes" << std::endl;
-            os << "    - Lookup arrays: " << z_table_count << " * " << (size_t)index_array_len << " * " << sizeof(uint8_t)
-            << " = " << z_table_count * index_array_len * sizeof(uint8_t) << " bytes" << std::endl;
-
-            os << "  Voxels (" << voxel_count << " voxels):" << std::endl;
-            os << "    - Structs + bounding boxes: " << voxel_count << " * (" 
-            << sizeof(Voxel) << " + " << (2 * sizeof(Point)) << ") = " 
-            << voxel_count * (sizeof(Voxel) + 2 * sizeof(Point)) << " bytes" << std::endl;
-
-            os << "  Point coordinates:" << std::endl;
-            os << "    - Total capacity: " << total_coordinate_capacity << " floats" << std::endl;
-            os << "    - Memory: " << total_coordinate_capacity << " * " << sizeof(float)
-            << " = " << point_data_memory << " bytes" << std::endl;
-
-            size_t total_hash_table_overhead = x_level_table_memory + y_tables_memory + z_tables_memory + voxels_memory;
-            size_t total_memory = total_hash_table_overhead + point_data_memory;
-
-            os << "Root hash table: " << x_level_table_memory << " bytes" << std::endl;
-            os << "Y-level tables: " << y_tables_memory << " bytes" << std::endl;
-            os << "Z-level tables: " << z_tables_memory << " bytes" << std::endl;
-            os << "Voxel structures: " << voxels_memory << " bytes" << std::endl;
-            os << "Point coordinate data: " << point_data_memory << " bytes" << std::endl;
-            os << "Total hash table overhead: " << total_hash_table_overhead << " bytes" << std::endl;
-            os << "Total memory usage: " << total_memory << " bytes ("
-            << std::fixed << std::setprecision(2) 
-            << total_memory / (1024.0 * 1024.0) << " MB)" << std::endl;
-
-            // Additional memory efficiency statistics
-            if (total_points > 0) {
-                double bytes_per_point = static_cast<double>(total_memory) / total_points;
-                double overhead_ratio = static_cast<double>(total_hash_table_overhead) / point_data_memory;
-                
-                os << "\n=== Memory Efficiency ===" << std::endl;
-                os << "Bytes per point: " << std::fixed << std::setprecision(2) << bytes_per_point << std::endl;
-                os << "Overhead ratio: " << std::fixed << std::setprecision(2) << overhead_ratio 
-                << " (hash tables / point data)" << std::endl;
-            }
-            os << "Coordinate Pool: " << point_coord_pool_size * sizeof(float) << std::endl;
-            os << "Index Array Pool: " << index_pool_size * sizeof(uint8_t) << std::endl;
+            global_aabb_min = Point{max_val, max_val, max_val};
+            global_aabb_max = Point{min_val, min_val, min_val};
         }
 
-        // Print detailed voxel contents for a specific region
-        void print_voxel_details(int x_start, int x_end, 
-                                int y_start, int y_end,
-                                int z_start, int z_end,
-                                std::ostream& os = std::cout) const {
-            os << "\n=== Voxel Details for Region [" 
-               << x_start << "-" << x_end << ", "
-               << y_start << "-" << y_end << ", "
-               << z_start << "-" << z_end << "] ===" << std::endl;
-            
-            for (int x = x_start; x <= x_end && x < index_array_len; ++x) {
-                if (x_level_table.x_coord_to_y_table_idx[x] == INVALID_INDEX) continue;
-                
-                uint8_t y_level_idx = x_level_table.x_coord_to_y_table_idx[x];
-                const auto& y_level = x_level_table.y_tables[y_level_idx];
-                
-                for (int y = y_start; y <= y_end && y < index_array_len; ++y) {
-                    if (y_level.y_coord_to_z_table_idx[y] == INVALID_INDEX) continue;
-                    
-                    uint8_t z_level_idx = y_level.y_coord_to_z_table_idx[y];
-                    const auto& z_level = y_level.z_tables[z_level_idx];
-                    
-                    for (int z = z_start; z <= z_end && z < index_array_len; ++z) {
-                        if (z_level.z_coord_to_voxel_idx[z] == INVALID_INDEX) continue;
-                        
-                        uint8_t voxel_idx = z_level.z_coord_to_voxel_idx[z];
-                        const auto& voxel = z_level.voxels[voxel_idx];
-                        
-                        os << "\nVoxel [" << x << ", " << y << ", " << z << "]:" << std::endl;
-                        os << "  Points: " << voxel.point_count << std::endl;
-                        os << "  AABB: [" 
-                           << voxel.bbox_min[0] << ", "
-                           << voxel.bbox_min[1] << ", "
-                           << voxel.bbox_min[2] << "] to ["
-                           << voxel.bbox_max[0] << ", "
-                           << voxel.bbox_max[1] << ", "
-                           << voxel.bbox_max[2] << "]" << std::endl;
-                        
-                        // Print first few points
-                        os << "  First " << std::min(size_t(3), voxel.point_count) 
-                           << " points:" << std::endl;
-                        for (size_t i = 0; i < std::min(size_t(3), voxel.point_count); ++i) {
-                            os << "    [" << voxel.x_coords[i] << ", "
-                               << voxel.y_coords[i] << ", "
-                               << voxel.z_coords[i] << "]" << std::endl;
-                        }
-                        if (voxel.point_count > 3) {
-                            os << "    ... (" << voxel.point_count - 3 
-                               << " more points)" << std::endl;
-                        }
-                    }
-                }
-            }
-        }
-
-        void initialize_memory_pool() {        
-            // 1. Estimate max # points per voxel
-            //    Here we assume distance between points is 2 cm 
-            const float estimated_max_point_per_voxel_dim = (max_query_radius) / 0.02;
-            // estimated_max_point_per_voxel = std::min((unsigned int)32, next_power_of_two(static_cast<unsigned int>(std::pow(estimated_max_point_per_voxel_dim, 3.0f))));
-            estimated_max_point_per_voxel = std::min((unsigned int)32, 
-                                            std::max((unsigned int)(FVectorT::num_scalars/sizeof(float)), 
-                                            next_power_of_two(static_cast<unsigned int>(std::pow(estimated_max_point_per_voxel_dim, 3.0f)))));
-            // std::cout << "Num point per voxel: " << estimated_max_point_per_voxel << std::endl;
-           
-            // 2. Calculate grid_width
+        void configure_grid() {
             const float workspace_width = workspace_aabb_max[0] - workspace_aabb_min[0];
-            grid_width = std::min(static_cast<uint8_t>(MAX_GRID_WIDTH), static_cast<uint8_t>(std::floor(workspace_width / (max_query_radius))));
             
-            // 3. Estimate pool size of point coord values
-            //    Point coord pool will allocate "estimated_max_point_per_voxel * 3" floats to a newly initialized voxel
-            //    Here we assume grid occupancy is 20%
-            point_coord_pool_size = static_cast<size_t>(grid_width) * grid_width * grid_width * 0.1 * (estimated_max_point_per_voxel * 3);
+            grid_width = static_cast<uint16_t>(std::min(
+                static_cast<uint32_t>(std::floor(workspace_width / max_query_radius)), // Empirically < 100 for manipulator robots
+                static_cast<uint32_t>(MAX_GRID_WIDTH) // upper bound
+            ));
+
+            inverse_scale_factor = grid_width / workspace_width;
+        }
+
+        void initialize_memory_pools() {    
+            initialize_point_coord_pool();
+            initialize_pointer_array_pool();
+            initialize_voxel_index_pool();
+            initialize_voxel_storage();
+        }
+
+        void initialize_point_coord_pool() {
+            estimated_max_point_per_voxel = std::pow(max_query_radius / 0.02, 3.0f);
             
+            const unsigned int point_coord_array_in_bytes = std::max(
+                next_power_of_two(static_cast<unsigned int>(estimated_max_point_per_voxel) * sizeof(float)),
+                static_cast<unsigned int>(FVectorT::num_scalars * sizeof(float)) // lower bound
+            );
+        
+            size_t point_coord_pool_size_in_bytes = 
+                static_cast<size_t>(grid_width) * grid_width * grid_width * 0.1 * 
+                static_cast<size_t>(point_coord_array_in_bytes) * 3;
+            
+            point_coord_pool_size = point_coord_pool_size_in_bytes / sizeof(float);
+            estimated_max_point_per_voxel = static_cast<size_t>(point_coord_array_in_bytes) / sizeof(float);
+
             void* raw_ptr = nullptr;
-            constexpr size_t COORD_ALIGNMENT = FVectorT::num_scalars * sizeof(float); // AVX2: 8*4, NEON: 4*4
-            if (posix_memalign(&raw_ptr, COORD_ALIGNMENT, point_coord_pool_size * sizeof(float)) != 0) {
+            
+            if (posix_memalign(&raw_ptr, 64, point_coord_pool_size_in_bytes) != 0) {
                 throw std::runtime_error("Failed to allocate aligned memory pool");
             }
-            // std::cout << "Num float in pool: " << point_coord_pool_size << std::endl;
+            
             point_coord_pool.reset(static_cast<float*>(raw_ptr));
-
-            // 4. Estimate pool size of table indices
-            const int estimated_tables = 1 + grid_width * 0.5 + grid_width * 0.5 * grid_width;
-            index_array_len = ALIGN_TO_CACHE_LINE(grid_width);
-            index_pool_size = estimated_tables * index_array_len;  // There are index_array_len entries per table
-            
-            void* idx_raw_ptr = nullptr;
-            if (posix_memalign(&idx_raw_ptr, 64, index_pool_size * sizeof(uint8_t)) != 0) {
-                throw std::runtime_error("Failed to allocate aligned index pool");
-            }
-            index_pool.reset(static_cast<uint8_t*>(idx_raw_ptr));
         }
 
-        void build_spatial_grid(const std::vector<Point>& points) {
-            const float workspace_width = workspace_aabb_max[0] - workspace_aabb_min[0];
-            inverse_scale_factor = grid_width / workspace_width;
+        void initialize_pointer_array_pool() {
+            const size_t estimated_tables = 1 + grid_width;
+            const size_t table_array_len_in_bytes = next_power_of_two(static_cast<unsigned int>(grid_width * sizeof(void*)));
+            const size_t pointer_array_pool_size_in_bytes = estimated_tables * table_array_len_in_bytes;
             
-            x_level_table.initialize_with_pool(allocate_index_array(), index_array_len);
-            x_level_table.y_tables.reserve(grid_width);
-            
-            for (const auto& point : points) {
-                const int gx = static_cast<int>((point[0] - workspace_aabb_min[0]) * inverse_scale_factor);
-                const int gy = static_cast<int>((point[1] - workspace_aabb_min[1]) * inverse_scale_factor);
-                const int gz = static_cast<int>((point[2] - workspace_aabb_min[2]) * inverse_scale_factor);
-                
-                uint8_t vx = static_cast<uint8_t>(std::clamp(gx, 0, MAX_GRID_WIDTH - 1));
-                uint8_t vy = static_cast<uint8_t>(std::clamp(gy, 0, MAX_GRID_WIDTH - 1));
-                uint8_t vz = static_cast<uint8_t>(std::clamp(gz, 0, MAX_GRID_WIDTH - 1));
-
-                insert_point(vx, vy, vz, point);
+            void* raw_ptr = nullptr;
+            if (posix_memalign(&raw_ptr, 64, pointer_array_pool_size_in_bytes) != 0) {
+                throw std::runtime_error("Failed to allocate aligned pointer array pool");
             }
+            
+            pointer_array_pool.reset(static_cast<void**>(raw_ptr));
+            pointer_array_pool_size = pointer_array_pool_size_in_bytes / sizeof(void*);
+            table_array_len = static_cast<uint16_t>(table_array_len_in_bytes / sizeof(void*));
         }
 
-        void compute_global_bounds() {
-            global_aabb_min = Point{std::numeric_limits<float>::max(), 
-                             std::numeric_limits<float>::max(), 
-                             std::numeric_limits<float>::max()};
-            global_aabb_max = Point{std::numeric_limits<float>::lowest(), 
-                             std::numeric_limits<float>::lowest(), 
-                             std::numeric_limits<float>::lowest()};
+        void initialize_voxel_index_pool() {
+            const size_t estimated_z_tables = static_cast<size_t>(grid_width) * grid_width * 0.5;
+            const size_t z_table_size_in_bytes = next_power_of_two(static_cast<unsigned int>(grid_width * sizeof(VoxelIndex)));
+            const size_t voxel_index_pool_size_in_bytes = estimated_z_tables * z_table_size_in_bytes;
             
-            for (const auto& y_table : x_level_table.y_tables) {
-                for (const auto& z_table : y_table.z_tables) {
-                    for (const auto& voxel : z_table.voxels) {
-                        global_aabb_min[0] = std::min(global_aabb_min[0], voxel.bbox_min[0]);
-                        global_aabb_min[1] = std::min(global_aabb_min[1], voxel.bbox_min[1]);
-                        global_aabb_min[2] = std::min(global_aabb_min[2], voxel.bbox_min[2]);
-                        global_aabb_max[0] = std::max(global_aabb_max[0], voxel.bbox_max[0]);
-                        global_aabb_max[1] = std::max(global_aabb_max[1], voxel.bbox_max[1]);
-                        global_aabb_max[2] = std::max(global_aabb_max[2], voxel.bbox_max[2]);
-                    }
-                }
+            void* raw_ptr = nullptr;
+            if (posix_memalign(&raw_ptr, 64, voxel_index_pool_size_in_bytes) != 0) {
+                throw std::runtime_error("Failed to allocate voxel index pool");
             }
+            
+            voxel_index_pool.reset(static_cast<VoxelIndex*>(raw_ptr));
+            voxel_index_pool_size = voxel_index_pool_size_in_bytes / sizeof(VoxelIndex);
+            z_table_array_len = static_cast<uint16_t>(z_table_size_in_bytes / sizeof(VoxelIndex));
+        }
+
+        void initialize_voxel_storage() {
+            const size_t estimated_voxel_count = 
+                static_cast<size_t>(grid_width) * grid_width * grid_width * 0.1;
+            voxel_storage.reserve(estimated_voxel_count);
         }
 
         void setup_simd_vectors() {
@@ -1125,149 +525,385 @@ namespace vamp::collision
             simd_workspace_min_z = FVectorT::fill(workspace_aabb_min[2]);
         }
 
-        void copy_memory_pool(const MVT& other) {
-            // Copy point coordinate pool
-            if (other.point_coord_pool && other.point_coord_pool_size > 0) {
-                void* raw_ptr = nullptr;
-                if (posix_memalign(&raw_ptr, 32, point_coord_pool_size * sizeof(float)) != 0) {
-                    throw std::runtime_error("Failed to allocate aligned memory pool");
-                }
-                // std::cout << "(Copy mem pool) Num float in pool: " << point_coord_pool_size << std::endl;
-                point_coord_pool.reset(static_cast<float*>(raw_ptr));
-                std::memcpy(point_coord_pool.get(), other.point_coord_pool.get(), 
-                point_coord_pool_used * sizeof(float));
-            }
-
-            // Copy index pool
-            if (other.index_pool && other.index_pool_size > 0) {
-                void* idx_raw_ptr = nullptr;
-                if (posix_memalign(&idx_raw_ptr, 64, index_pool_size * sizeof(uint8_t)) != 0) {
-                    throw std::runtime_error("Failed to allocate aligned index pool");
-                }
-                index_pool.reset(static_cast<uint8_t*>(idx_raw_ptr));
-                std::memcpy(index_pool.get(), other.index_pool.get(), 
-                            index_pool_used * sizeof(uint8_t));
-            }
-        }
-
-        void update_voxel_pointers_after_copy(const MVT& other) {
-            // Calculate offset between old and new pools
-            const ptrdiff_t pool_offset = point_coord_pool.get() - other.point_coord_pool.get();
-            const ptrdiff_t index_offset = index_pool.get() - other.index_pool.get();
-
-            // Update root table index pointer
-            if (x_level_table.x_coord_to_y_table_idx) {
-                x_level_table.x_coord_to_y_table_idx += index_offset;
-            }
-            
-            // Update all voxel pointers
-            for (auto& y_table : x_level_table.y_tables) {
-                if (y_table.y_coord_to_z_table_idx) {
-                    y_table.y_coord_to_z_table_idx += index_offset;
-                }
-
-                for (auto& z_table : y_table.z_tables) {
-                    if (z_table.z_coord_to_voxel_idx) {
-                        z_table.z_coord_to_voxel_idx += index_offset;
-                    }
-
-                    for (auto& voxel : z_table.voxels) {
-                        if (voxel.x_coords) {
-                            voxel.x_coords += pool_offset;
-                            voxel.y_coords += pool_offset;
-                            voxel.z_coords += pool_offset;
-                        }
-                    }
-                }
-            }
-        }
+        // ====================================================================
+        // SPATIAL GRID CONSTRUCTION
+        // ====================================================================
         
-        void insert_point(uint8_t voxel_x, uint8_t voxel_y, uint8_t voxel_z, const Point& point) {
-            // Level 1: Map X coordinate to Y-level table
-            uint8_t y_level_index = x_level_table.x_coord_to_y_table_idx[voxel_x];
-            if (y_level_index == INVALID_INDEX) {
-                y_level_index = static_cast<uint8_t>(x_level_table.y_tables.size());
-                x_level_table.x_coord_to_y_table_idx[voxel_x] = y_level_index;
-                x_level_table.y_tables.emplace_back();
+        void build_spatial_grid(const std::vector<Point>& points) {
+            // Initialize root of three-level table hierarchy
+            x_level_table = allocate_pointer_table<XLevelTable>();
+            
+            // Insert each point into the corresponding voxel
+            for (const auto& point : points) {
+                // Transform point coordinates to grid space
+                const float voxel_x_float = (point[0] - workspace_aabb_min[0]) * inverse_scale_factor;
+                const float voxel_y_float = (point[1] - workspace_aabb_min[1]) * inverse_scale_factor;
+                const float voxel_z_float = (point[2] - workspace_aabb_min[2]) * inverse_scale_factor;
+                if ((voxel_x_float >= grid_width) || (voxel_y_float >= grid_width) || (voxel_z_float >= grid_width)) {
+                    std::cout << "warning: voxel coordinate (" << voxel_x_float << ", " << voxel_y_float  << ", " << voxel_z_float
+                              << ") will be clamped within [0, " << grid_width - 1 << "]" << std::endl;
+                }
 
-                // Initialize Y-level table with pool
-                x_level_table.y_tables.back().initialize_with_pool(allocate_index_array(), index_array_len);
-                x_level_table.y_tables.back().z_tables.reserve(grid_width);
+                // Clamp to valid grid indices just in case
+                const uint16_t voxel_x = static_cast<uint16_t>(std::clamp(voxel_x_float, 0.0f, static_cast<float>(grid_width - 1)));
+                const uint16_t voxel_y = static_cast<uint16_t>(std::clamp(voxel_y_float, 0.0f, static_cast<float>(grid_width - 1)));
+                const uint16_t voxel_z = static_cast<uint16_t>(std::clamp(voxel_z_float, 0.0f, static_cast<float>(grid_width - 1)));
+                // Intervals are half-open [lower, upper) except for the last voxel
+
+                // Level 1: Get or create Y-level table
+                YLevelTable y_level_table = x_level_table[voxel_x];
+                if (y_level_table == nullptr) {
+                    y_level_table = allocate_pointer_table<YLevelTable>();
+                    x_level_table[voxel_x] = y_level_table;
+                }
+                
+                // Level 2: Get or create Z-level table (voxel index table)
+                ZLevelTable z_level_table = y_level_table[voxel_y];
+                if (z_level_table == nullptr) {
+                    z_level_table = allocate_index_table();
+                    y_level_table[voxel_y] = z_level_table;
+                }
+                
+                // Level 3: Get or create voxel
+                VoxelIndex voxel_index = z_level_table[voxel_z];
+                if (voxel_index == INVALID_VOXEL_INDEX) {
+                    // Check capacity before adding to prevent reallocation during insertion
+                    if (voxel_storage.size() >= voxel_storage.capacity()) {
+                        std::cout << "Voxel storage capacity exceeded. Please consider reserving larger space." << std::endl;
+                    }
+                    
+                    // Create new voxel and assign index
+                    voxel_index = static_cast<VoxelIndex>(voxel_storage.size());
+                    voxel_storage.emplace_back();
+                    z_level_table[voxel_z] = voxel_index;
+                    
+                    // Allocate coordinate storage from memory pool
+                    float* x_ptr = allocate_coords(estimated_max_point_per_voxel);
+                    float* y_ptr = allocate_coords(estimated_max_point_per_voxel);
+                    float* z_ptr = allocate_coords(estimated_max_point_per_voxel);
+                    voxel_storage[voxel_index].initialize_with_pool(x_ptr, y_ptr, z_ptr, estimated_max_point_per_voxel);
+                }
+                
+                // Add point to voxel
+                voxel_storage[voxel_index].add_point(point);
+            }
+        }
+
+        void compute_global_bounds() {
+            initialize_empty_bounds();
+            
+            for (const auto& voxel : voxel_storage) {
+                if (voxel.point_count > 0) {
+                    global_aabb_min[0] = std::min(global_aabb_min[0], voxel.bbox_min[0]);
+                    global_aabb_min[1] = std::min(global_aabb_min[1], voxel.bbox_min[1]);
+                    global_aabb_min[2] = std::min(global_aabb_min[2], voxel.bbox_min[2]);
+                    global_aabb_max[0] = std::max(global_aabb_max[0], voxel.bbox_max[0]);
+                    global_aabb_max[1] = std::max(global_aabb_max[1], voxel.bbox_max[1]);
+                    global_aabb_max[2] = std::max(global_aabb_max[2], voxel.bbox_max[2]);
+                }
+            }
+        }
+
+        // ====================================================================
+        // MEMORY POOL ALLOCATION
+        // ====================================================================
+        
+        template<typename T>
+        T allocate_pointer_table() {
+            if (pointer_array_pool_used + table_array_len > pointer_array_pool_size) {
+                throw std::runtime_error("Pointer array pool exhausted");
             }
             
-            auto& y_level_table = x_level_table.y_tables[y_level_index];
-            
-            // Level 2: Map Y coordinate to Z-level table
-            uint8_t z_level_index = y_level_table.y_coord_to_z_table_idx[voxel_y];
-            if (z_level_index == INVALID_INDEX) {
-                z_level_index = static_cast<uint8_t>(y_level_table.z_tables.size());
-                y_level_table.y_coord_to_z_table_idx[voxel_y] = z_level_index;
-                y_level_table.z_tables.emplace_back();
+            T result = reinterpret_cast<T>(pointer_array_pool.get() + pointer_array_pool_used);
+            std::fill(result, result + table_array_len, nullptr);
+            pointer_array_pool_used += table_array_len;
+            return result;
+        }
 
-                // Initialize Z-level table with pool
-                y_level_table.z_tables.back().initialize_with_pool(allocate_index_array(), index_array_len);
-                y_level_table.z_tables.back().voxels.reserve(grid_width);
+        ZLevelTable allocate_index_table() {
+            if (voxel_index_pool_used + z_table_array_len > voxel_index_pool_size) {
+                throw std::runtime_error("Voxel index pool exhausted");
             }
             
-            auto& z_level_table = y_level_table.z_tables[z_level_index];
-            
-            // Level 3: Map Z coordinate to voxel
-            uint8_t voxel_index = z_level_table.z_coord_to_voxel_idx[voxel_z];
-            if (voxel_index == INVALID_INDEX) {
-                voxel_index = static_cast<uint8_t>(z_level_table.voxels.size());
-                z_level_table.z_coord_to_voxel_idx[voxel_z] = voxel_index;
-                z_level_table.voxels.emplace_back();
-
-                // Allocate space from pool
-                float* x_ptr = allocate_coords(estimated_max_point_per_voxel);
-                float* y_ptr = allocate_coords(estimated_max_point_per_voxel);
-                float* z_ptr = allocate_coords(estimated_max_point_per_voxel);
-                z_level_table.voxels.back().initialize_with_pool(x_ptr, y_ptr, z_ptr, estimated_max_point_per_voxel);
-            }
-            
-            z_level_table.voxels[voxel_index].add_point(point);
+            ZLevelTable result = voxel_index_pool.get() + voxel_index_pool_used;
+            std::fill(result, result + z_table_array_len, INVALID_VOXEL_INDEX);
+            voxel_index_pool_used += z_table_array_len;
+            return result;
         }
 
         float* allocate_coords(size_t count) {
-            // Align count to SIMD boundary
-            const size_t aligned_count = ALIGN_TO_SIMD_WIDTH(count);
-            if (point_coord_pool_used + aligned_count > point_coord_pool_size) {
+            if (point_coord_pool_used + count > point_coord_pool_size) {
                 throw std::runtime_error("Point coordinate pool exhausted");
             }
             
             float* result = point_coord_pool.get() + point_coord_pool_used;
-            std::fill(result, result + aligned_count, 0.0f);
-
-            point_coord_pool_used += aligned_count;
+            std::fill(result, result + count, std::numeric_limits<float>::infinity());
+            point_coord_pool_used += count;
             return result;
         }
 
-        uint8_t* allocate_index_array() {
-            if (index_pool_used + index_array_len > index_pool_size) {
-                throw std::runtime_error("Index pool exhausted");
+        // ====================================================================
+        // COPY CONSTRUCTOR HELPERS
+        // ====================================================================
+        
+        void copy_memory_pools(const MVT& other) {
+            copy_point_coord_pool(other);
+            copy_pointer_array_pool(other);
+            copy_voxel_index_pool(other);
+        }
+
+        void copy_point_coord_pool(const MVT& other) {
+            if (!other.point_coord_pool || other.point_coord_pool_size == 0) return;
+            
+            void* raw_ptr = nullptr;
+
+            if (posix_memalign(&raw_ptr, 64, point_coord_pool_size * sizeof(float)) != 0) {
+                throw std::runtime_error("Failed to allocate aligned memory pool");
             }
             
-            uint8_t* result = index_pool.get() + index_pool_used;
-            index_pool_used += index_array_len;
-
-            return result;
+            point_coord_pool.reset(static_cast<float*>(raw_ptr));
+            std::memcpy(point_coord_pool.get(), other.point_coord_pool.get(), 
+                       point_coord_pool_used * sizeof(float));
         }
 
+        void copy_pointer_array_pool(const MVT& other) {
+            if (!other.pointer_array_pool || other.pointer_array_pool_size == 0) return;
+            
+            void* raw_ptr = nullptr;
+            if (posix_memalign(&raw_ptr, 64, pointer_array_pool_size * sizeof(void*)) != 0) {
+                throw std::runtime_error("Failed to allocate aligned pointer array pool");
+            }
+            
+            pointer_array_pool.reset(static_cast<void**>(raw_ptr));
+            std::memcpy(pointer_array_pool.get(), other.pointer_array_pool.get(), 
+                       pointer_array_pool_used * sizeof(void*));
+        }
+
+        void copy_voxel_index_pool(const MVT& other) {
+            if (!other.voxel_index_pool || other.voxel_index_pool_size == 0) return;
+            
+            void* raw_ptr = nullptr;
+            if (posix_memalign(&raw_ptr, 64, voxel_index_pool_size * sizeof(VoxelIndex)) != 0) {
+                throw std::runtime_error("Failed to allocate voxel index pool");
+            }
+            
+            voxel_index_pool.reset(static_cast<VoxelIndex*>(raw_ptr));
+            std::memcpy(voxel_index_pool.get(), other.voxel_index_pool.get(), 
+                       voxel_index_pool_used * sizeof(VoxelIndex));
+        }
+
+        void update_pointers_after_copy(const MVT& other) {
+            relocate_table_hierarchy(other);
+            relocate_voxel_coordinates(other);
+        }
+
+        void relocate_table_hierarchy(const MVT& other) {
+            const ptrdiff_t idx_pool_offset = reinterpret_cast<char*>(voxel_index_pool.get()) - 
+                                              reinterpret_cast<char*>(other.voxel_index_pool.get());
+            
+            // Relocate root X-level table
+            ptrdiff_t x_table_offset = reinterpret_cast<void**>(other.x_level_table) - 
+                                       other.pointer_array_pool.get();
+            x_level_table = reinterpret_cast<XLevelTable>(pointer_array_pool.get() + x_table_offset);
+            
+            // Fix pointers in X and Y tables
+            for (size_t i = 0; i < table_array_len; ++i) {
+                if (x_level_table[i] != nullptr) {
+                    relocate_y_table(i, other, idx_pool_offset);
+                }
+            }
+        }
+
+        void relocate_y_table(size_t x_idx, const MVT& other, ptrdiff_t idx_pool_offset) {
+            YLevelTable old_y_ptr = x_level_table[x_idx];
+            ptrdiff_t y_offset = reinterpret_cast<void**>(old_y_ptr) - other.pointer_array_pool.get();
+            x_level_table[x_idx] = reinterpret_cast<YLevelTable>(pointer_array_pool.get() + y_offset);
+            
+            for (size_t j = 0; j < z_table_array_len; ++j) {
+                if (x_level_table[x_idx][j] != nullptr) {
+                    relocate_z_table(x_idx, j, other, idx_pool_offset);
+                }
+            }
+        }
+
+        void relocate_z_table(size_t x_idx, size_t y_idx, const MVT& other, ptrdiff_t idx_pool_offset) {
+            ZLevelTable old_z_ptr = x_level_table[x_idx][y_idx];
+            ptrdiff_t z_offset = reinterpret_cast<const char*>(old_z_ptr) - 
+                                reinterpret_cast<const char*>(other.voxel_index_pool.get());
+            x_level_table[x_idx][y_idx] = reinterpret_cast<ZLevelTable>(
+                reinterpret_cast<char*>(voxel_index_pool.get()) + z_offset);
+        }
+
+        void relocate_voxel_coordinates(const MVT& other) {
+            for (size_t idx = 0; idx < voxel_storage.size(); ++idx) {
+                auto& voxel = voxel_storage[idx];
+                const auto& other_voxel = other.voxel_storage[idx];
+                
+                if (other_voxel.x_coords != nullptr) {
+                    voxel.x_coords = point_coord_pool.get() + (other_voxel.x_coords - other.point_coord_pool.get());
+                    voxel.y_coords = point_coord_pool.get() + (other_voxel.y_coords - other.point_coord_pool.get());
+                    voxel.z_coords = point_coord_pool.get() + (other_voxel.z_coords - other.point_coord_pool.get());
+                }
+            }
+        }
+
+        // ====================================================================
+        // UTILITY FUNCTIONS
+        // ====================================================================
+        
         unsigned int next_power_of_two(unsigned int n) {
             if (n == 0) return 1;
             n--;
-    
             n |= n >> 1;
             n |= n >> 2;
             n |= n >> 4;
             n |= n >> 8;
             n |= n >> 16;
-        
             n++;
-        
             return n;
         }
-    };
 
-    
+        void write_statistics(const std::string& filepath) const {
+            std::ofstream out(filepath);
+            if (!out.is_open()) {
+                throw std::runtime_error("Failed to open file: " + filepath);
+            }
+            
+            out << std::fixed << std::setprecision(6);
+            write_basic_info(out);
+            write_table_structure_stats(out);
+            write_memory_usage_stats(out);
+            write_efficiency_metrics(out);
+            
+            out.close();
+        }
+
+        void write_basic_info(std::ofstream& out) const {
+            out << "========================================\n";
+            out << "MVT STRUCTURE STATISTICS\n";
+            out << "========================================\n\n";
+            out << "--- Basic Information ---\n";
+            
+            Point workspace_size = {
+                workspace_aabb_max[0] - workspace_aabb_min[0],
+                workspace_aabb_max[1] - workspace_aabb_min[1],
+                workspace_aabb_max[2] - workspace_aabb_min[2]
+            };
+            
+            out << "Workspace AABB Size: [" << workspace_size[0] << ", " 
+                << workspace_size[1] << ", " << workspace_size[2] << "]\n";
+            out << "Query Radius Range: [" << min_query_radius << ", " << max_query_radius << "]\n";
+            out << "Point Radius: " << point_radius << "\n";
+            out << "Grid Width: " << static_cast<int>(grid_width) << "\n";
+            out << "Total Possible Voxels: " << (static_cast<int>(grid_width) * grid_width * grid_width) << "\n";
+            out << "Non-empty Voxels: " << voxel_storage.size() << "\n";
+            
+            write_point_statistics(out);
+        }
+
+        void write_point_statistics(std::ofstream& out) const {
+            size_t total_points = 0;
+            size_t max_points = 0;
+            size_t min_points = std::numeric_limits<size_t>::max();
+            
+            for (const auto& voxel : voxel_storage) {
+                total_points += voxel.point_count;
+                max_points = std::max(max_points, voxel.point_count);
+                if (voxel.point_count > 0) {
+                    min_points = std::min(min_points, voxel.point_count);
+                }
+            }
+            
+            out << "Total Points: " << total_points << "\n";
+            out << "Min Points in Voxel: " << (min_points == std::numeric_limits<size_t>::max() ? 0 : min_points) << "\n";
+            out << "Max Points in Voxel: " << max_points << "\n";
+            if (!voxel_storage.empty()) {
+                out << "Average Points Per Voxel: " << (static_cast<double>(total_points) / voxel_storage.size()) << "\n";
+            }
+        }
+
+        void write_table_structure_stats(std::ofstream& out) const {
+            out << "\n--- Three Level Table Structure ---\n";
+            
+            size_t non_empty_x = 0, non_empty_y = 0, non_empty_z = 0;
+            count_non_empty_tables(non_empty_x, non_empty_y, non_empty_z);
+            
+            out << "Non-empty X entries: " << non_empty_x << " / " << static_cast<int>(table_array_len) << "\n";
+            out << "Non-empty Y entries: " << non_empty_y << " (across all X)\n";
+            out << "Non-empty Z entries: " << non_empty_z << " (across all Y)\n";
+            out << "Table occupancy: " << (static_cast<double>(non_empty_z) / (grid_width * grid_width * grid_width) * 100.0) << "%\n";
+        }
+
+        void count_non_empty_tables(size_t& x_count, size_t& y_count, size_t& z_count) const {
+            for (size_t x = 0; x < table_array_len; ++x) {
+                if (x_level_table[x] != nullptr) {
+                    x_count++;
+                    YLevelTable y_table = x_level_table[x];
+                    
+                    for (size_t y = 0; y < table_array_len; ++y) {
+                        if (y_table[y] != nullptr) {
+                            y_count++;
+                            ZLevelTable z_table = y_table[y];
+                            
+                            for (size_t z = 0; z < z_table_array_len; ++z) {
+                                if (z_table[z] != INVALID_VOXEL_INDEX) {
+                                    z_count++;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        void write_memory_usage_stats(std::ofstream& out) const {
+            out << "\n--- Memory Pool Usage ---\n";
+            
+            write_pool_stats(out, "Point Coordinate Pool",
+                           point_coord_pool_size * sizeof(float),
+                           point_coord_pool_used * sizeof(float));
+            
+            write_pool_stats(out, "Pointer Array Pool",
+                           pointer_array_pool_size * sizeof(void*),
+                           pointer_array_pool_used * sizeof(void*));
+            
+            write_pool_stats(out, "Voxel Index Pool",
+                           voxel_index_pool_size * sizeof(VoxelIndex),
+                           voxel_index_pool_used * sizeof(VoxelIndex));
+            
+            size_t voxel_struct_bytes = voxel_storage.size() * sizeof(Voxel);
+            size_t voxel_capacity_bytes = voxel_storage.capacity() * sizeof(Voxel);
+            out << "Voxel Storage (metadata):\n";
+            out << "  Used: " << voxel_struct_bytes << " bytes (" << (voxel_struct_bytes / 1024.0) << " KB)\n";
+            out << "  Capacity: " << voxel_capacity_bytes << " bytes (" << (voxel_capacity_bytes / 1024.0) << " KB)\n";
+        }
+
+        void write_pool_stats(std::ofstream& out, const std::string& name, 
+                            size_t allocated, size_t used) const {
+            double usage_pct = allocated > 0 ? (static_cast<double>(used) / allocated) * 100.0 : 0.0;
+            
+            out << name << ":\n";
+            out << "  Allocated: " << allocated << " bytes (" << (allocated / (1024.0 * 1024.0)) << " MB)\n";
+            out << "  Used: " << used << " bytes (" << (used / (1024.0 * 1024.0)) << " MB)\n";
+            out << "  Usage: " << usage_pct << "%\n";
+        }
+
+        void write_efficiency_metrics(std::ofstream& out) const {
+            out << "\n--- Efficiency Metrics ---\n";
+            
+            size_t total_points = std::accumulate(voxel_storage.begin(), voxel_storage.end(), 0UL,
+                [](size_t sum, const Voxel& v) { return sum + v.point_count; });
+            
+            size_t total_memory = point_coord_pool_size * sizeof(float) + 
+                                 pointer_array_pool_size + 
+                                 voxel_index_pool_size * sizeof(VoxelIndex) +
+                                 voxel_storage.capacity() * sizeof(Voxel);
+            
+            if (total_points > 0) {
+                out << "Bytes per point: " << (static_cast<double>(total_memory) / total_points) << "\n";
+            }
+            
+            out << "\n========================================\n";
+        }
+    };
 }  // namespace vamp::collision
