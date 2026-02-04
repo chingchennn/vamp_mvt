@@ -67,7 +67,7 @@ namespace vamp::collision
                 point_count = 0;
             }
 
-            void add_point(const Point& point) {
+            void add_point(const Point& point, const float& point_radius) {
                 if (point_count >= capacity) {
                     std::cout << "Try to add " << point_count + 1 << "th point to a voxel" << std::endl;
                     throw std::runtime_error("Voxel capacity exceeded");
@@ -77,21 +77,29 @@ namespace vamp::collision
                 y_coords[point_count] = point[1];
                 z_coords[point_count] = point[2];
                 
-                update_bounding_box(point);
+                update_bounding_box(point, point_radius);
                 ++point_count;
             }
 
         private:
-            void update_bounding_box(const Point& point) {
+            void update_bounding_box(const Point& point, const float& point_radius) {
+                float px_min = point[0] - point_radius;
+                float py_min = point[1] - point_radius;
+                float pz_min = point[2] - point_radius;
+                float px_max = point[0] + point_radius;
+                float py_max = point[1] + point_radius;
+                float pz_max = point[2] + point_radius;
+
                 if (point_count == 0) {
-                    bbox_min = bbox_max = point;
+                    bbox_min = {px_min, py_min, pz_min};
+                    bbox_max = {px_max, py_max, pz_max};
                 } else {
-                    bbox_min[0] = std::min(bbox_min[0], point[0]);
-                    bbox_min[1] = std::min(bbox_min[1], point[1]);
-                    bbox_min[2] = std::min(bbox_min[2], point[2]);
-                    bbox_max[0] = std::max(bbox_max[0], point[0]);
-                    bbox_max[1] = std::max(bbox_max[1], point[1]);
-                    bbox_max[2] = std::max(bbox_max[2], point[2]);
+                    bbox_min[0] = std::min(bbox_min[0], px_min);
+                    bbox_min[1] = std::min(bbox_min[1], py_min);
+                    bbox_min[2] = std::min(bbox_min[2], pz_min);
+                    bbox_max[0] = std::max(bbox_max[0], px_max);
+                    bbox_max[1] = std::max(bbox_max[1], py_max);
+                    bbox_max[2] = std::max(bbox_max[2], pz_max);
                 }
             }
         };
@@ -438,7 +446,7 @@ namespace vamp::collision
             const float workspace_width = workspace_aabb_max[0] - workspace_aabb_min[0];
             
             grid_width = static_cast<uint16_t>(std::min(
-                static_cast<uint32_t>(std::floor(workspace_width / max_query_radius)), // Empirically < 100 for manipulator robots
+                static_cast<uint32_t>(std::floor(workspace_width / (max_query_radius + point_radius))), // Empirically < 100 for manipulator robots
                 static_cast<uint32_t>(MAX_GRID_WIDTH) // upper bound
             ));
 
@@ -585,7 +593,7 @@ namespace vamp::collision
                 }
                 
                 // Add point to voxel
-                voxel_storage[voxel_index].add_point(point);
+                voxel_storage[voxel_index].add_point(point, point_radius);
             }
         }
 
