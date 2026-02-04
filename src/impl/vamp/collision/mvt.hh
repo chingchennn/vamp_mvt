@@ -462,12 +462,13 @@ namespace vamp::collision
 
         void initialize_point_coord_pool() {
             estimated_max_point_per_voxel = std::pow(max_query_radius / 0.02, 3.0f);
-            
-            const unsigned int point_coord_array_in_bytes = std::max(
-                next_power_of_two(static_cast<unsigned int>(estimated_max_point_per_voxel) * sizeof(float)),
-                static_cast<unsigned int>(FVectorT::num_scalars * sizeof(float)) // lower bound
-            );
-        
+
+            auto align_to_simd = [](size_t n) {
+                if (n == 0) return FVectorT::num_scalars;
+                return ((n + FVectorT::num_scalars - 1) / FVectorT::num_scalars) * FVectorT::num_scalars;
+            };
+            const unsigned int point_coord_array_in_bytes = align_to_simd(estimated_max_point_per_voxel) * sizeof(float);
+
             size_t point_coord_pool_size_in_bytes = 
                 static_cast<size_t>(grid_width) * grid_width * grid_width * 0.1 * 
                 static_cast<size_t>(point_coord_array_in_bytes) * 3;
@@ -486,7 +487,7 @@ namespace vamp::collision
 
         void initialize_pointer_array_pool() {
             const size_t estimated_tables = 1 + grid_width;
-            const size_t table_array_len_in_bytes = next_power_of_two(static_cast<unsigned int>(grid_width * sizeof(void*)));
+            const size_t table_array_len_in_bytes = grid_width * sizeof(void*);
             const size_t pointer_array_pool_size_in_bytes = estimated_tables * table_array_len_in_bytes;
             
             void* raw_ptr = nullptr;
@@ -501,7 +502,7 @@ namespace vamp::collision
 
         void initialize_voxel_index_pool() {
             const size_t estimated_z_tables = static_cast<size_t>(grid_width) * grid_width * 0.5;
-            const size_t z_table_size_in_bytes = next_power_of_two(static_cast<unsigned int>(grid_width * sizeof(VoxelIndex)));
+            const size_t z_table_size_in_bytes = grid_width * sizeof(VoxelIndex);
             const size_t voxel_index_pool_size_in_bytes = estimated_z_tables * z_table_size_in_bytes;
             
             void* raw_ptr = nullptr;
