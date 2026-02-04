@@ -295,12 +295,12 @@ namespace vamp::collision
             const FVectorT query_radii = radii + point_radius_vec;
 
             // SIMD global AABB check - cull entire lanes that are completely outside
-            const auto outside_x_low = (centers[0] + query_radii) < simd_global_min_x;
-            const auto outside_x_high = simd_global_max_x < (centers[0] - query_radii);
-            const auto outside_y_low = (centers[1] + query_radii) < simd_global_min_y;
-            const auto outside_y_high = simd_global_max_y < (centers[1] - query_radii);
-            const auto outside_z_low = (centers[2] + query_radii) < simd_global_min_z;
-            const auto outside_z_high = simd_global_max_z < (centers[2] - query_radii);
+            const auto outside_x_low = (centers[0]) < (simd_global_min_x - query_radii);
+            const auto outside_x_high = (simd_global_max_x + query_radii) < (centers[0]);
+            const auto outside_y_low = (centers[1]) < (simd_global_min_y - query_radii);
+            const auto outside_y_high = (simd_global_max_y + query_radii) < (centers[1]);
+            const auto outside_z_low = (centers[2]) < (simd_global_min_z - query_radii);
+            const auto outside_z_high = (simd_global_max_z + query_radii) < (centers[2]);
             
             const auto outside_mask = outside_x_low | outside_x_high | 
                                     outside_y_low | outside_y_high | 
@@ -550,10 +550,6 @@ namespace vamp::collision
                 const float voxel_x_float = (point[0] - workspace_aabb_min[0]) * inverse_scale_factor;
                 const float voxel_y_float = (point[1] - workspace_aabb_min[1]) * inverse_scale_factor;
                 const float voxel_z_float = (point[2] - workspace_aabb_min[2]) * inverse_scale_factor;
-                if ((voxel_x_float >= grid_width) || (voxel_y_float >= grid_width) || (voxel_z_float >= grid_width)) {
-                    std::cout << "warning: voxel coordinate (" << voxel_x_float << ", " << voxel_y_float  << ", " << voxel_z_float
-                              << ") will be clamped within [0, " << grid_width - 1 << "]" << std::endl;
-                }
 
                 // Clamp to valid grid indices just in case
                 const uint16_t voxel_x = static_cast<uint16_t>(std::clamp(voxel_x_float, 0.0f, static_cast<float>(grid_width - 1)));
