@@ -232,12 +232,13 @@ namespace vamp::collision
             const float grid_center_z_float = (center[2] - workspace_aabb_min[2]) * inverse_scale_factor;
             
             //Calculate voxel iteration bounds
+            const float ceil_hack = 0.9999f;
             const uint16_t min_x = static_cast<uint16_t>(std::max(0.0f, (grid_center_x_float - grid_query_radius)));
-            const uint16_t max_x = static_cast<uint16_t>(std::min(static_cast<float>(grid_width - 1), (grid_center_x_float + grid_query_radius)));
+            const uint16_t max_x = static_cast<uint16_t>(std::min(static_cast<float>(grid_width - 1), (grid_center_x_float + grid_query_radius + ceil_hack)));
             const uint16_t min_y = static_cast<uint16_t>(std::max(0.0f, (grid_center_y_float - grid_query_radius)));
-            const uint16_t max_y = static_cast<uint16_t>(std::min(static_cast<float>(grid_width - 1), (grid_center_y_float + grid_query_radius)));
+            const uint16_t max_y = static_cast<uint16_t>(std::min(static_cast<float>(grid_width - 1), (grid_center_y_float + grid_query_radius + ceil_hack)));
             const uint16_t min_z = static_cast<uint16_t>(std::max(0.0f, (grid_center_z_float - grid_query_radius)));
-            const uint16_t max_z = static_cast<uint16_t>(std::min(static_cast<float>(grid_width - 1), (grid_center_z_float + grid_query_radius)));
+            const uint16_t max_z = static_cast<uint16_t>(std::min(static_cast<float>(grid_width - 1), (grid_center_z_float + grid_query_radius + ceil_hack)));
 
             // Traverse three-level spatial hierarchy
             for (uint16_t voxel_x = min_x; voxel_x <= max_x; ++voxel_x) {
@@ -344,12 +345,13 @@ namespace vamp::collision
                 const float grid_center_z_float = grid_z_array[sphere_idx];
                 
                 // Calculate voxel iteration bounds for this sphere
+                const float ceil_hack = 0.9999f;
                 const uint16_t min_x = static_cast<uint16_t>(std::max(0.0f, (grid_center_x_float - grid_query_radius)));
-                const uint16_t max_x = static_cast<uint16_t>(std::min(static_cast<float>(grid_width - 1), (grid_center_x_float + grid_query_radius)));
+                const uint16_t max_x = static_cast<uint16_t>(std::min(static_cast<float>(grid_width - 1), (grid_center_x_float + grid_query_radius + ceil_hack)));
                 const uint16_t min_y = static_cast<uint16_t>(std::max(0.0f, (grid_center_y_float - grid_query_radius)));
-                const uint16_t max_y = static_cast<uint16_t>(std::min(static_cast<float>(grid_width - 1), (grid_center_y_float + grid_query_radius)));
+                const uint16_t max_y = static_cast<uint16_t>(std::min(static_cast<float>(grid_width - 1), (grid_center_y_float + grid_query_radius + ceil_hack)));
                 const uint16_t min_z = static_cast<uint16_t>(std::max(0.0f, (grid_center_z_float - grid_query_radius)));
-                const uint16_t max_z = static_cast<uint16_t>(std::min(static_cast<float>(grid_width - 1), (grid_center_z_float + grid_query_radius)));
+                const uint16_t max_z = static_cast<uint16_t>(std::min(static_cast<float>(grid_width - 1), (grid_center_z_float + grid_query_radius + ceil_hack)));
 
                 // Traverse spatial hierarchy for this sphere
                 for (uint16_t voxel_x = min_x; voxel_x <= max_x; ++voxel_x) {
