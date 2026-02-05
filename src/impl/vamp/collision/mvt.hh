@@ -39,9 +39,10 @@ namespace vamp::collision
         static constexpr uint16_t MAX_GRID_WIDTH = std::numeric_limits<uint16_t>::max();
         
         // Three-level table types
-        using ZLevelTable = uint32_t*;      // Z table: voxel indices
-        using YLevelTable = uint32_t**;     // Y table: pointers to Z tables
-        using XLevelTable = uint32_t***;    // X table: pointers to Y tables
+        using TableOffset = uint32_t;
+        using ZLevelTable = VoxelIndex*;   
+        using YLevelTable = TableOffset*;  
+        using XLevelTable = TableOffset*;
 
         // ====================================================================
         // VOXEL STRUCTURE
@@ -131,14 +132,11 @@ namespace vamp::collision
         size_t point_coord_pool_used = 0;
         size_t estimated_max_point_per_voxel = 0;
         
-        std::unique_ptr<void*[], decltype(&std::free)> pointer_array_pool{nullptr, &std::free};
-        size_t pointer_array_pool_size = 0;
-        size_t pointer_array_pool_used = 0;
+        static constexpr TableOffset NULL_OFFSET = std::numeric_limits<TableOffset>::max();
+        std::unique_ptr<uint8_t[], decltype(&std::free)> hierarchy_pool{nullptr, &std::free};
+        size_t hierarchy_pool_size_bytes = 0;
+        size_t hierarchy_pool_used_bytes = 0;
         
-        std::unique_ptr<VoxelIndex[], decltype(&std::free)> voxel_index_pool{nullptr, &std::free};
-        size_t voxel_index_pool_size = 0;
-        size_t voxel_index_pool_used = 0;
-
         // Voxel storage and hierarchy entry
         std::vector<Voxel> voxel_storage;
         XLevelTable x_level_table = nullptr;
@@ -152,8 +150,7 @@ namespace vamp::collision
         // CONSTRUCTOR & DESTRUCTOR
         // ====================================================================
         
-        MVT(
-            const std::vector<Point>& points,
+        MVT(const std::vector<Point>& points,
             const float min_radius,
             const float max_radius,
             const Point &workspace_aabb_min, 
@@ -175,6 +172,7 @@ namespace vamp::collision
             build_spatial_grid(points);
             compute_global_bounds();
             setup_simd_vectors();
+            // record_mvt_state_to_file("scripts/log/");
         }
 
         MVT(const MVT& other)
@@ -192,10 +190,12 @@ namespace vamp::collision
               point_coord_pool_size(other.point_coord_pool_size),
               point_coord_pool_used(other.point_coord_pool_used),
               estimated_max_point_per_voxel(other.estimated_max_point_per_voxel),
-              pointer_array_pool_size(other.pointer_array_pool_size),
-              pointer_array_pool_used(other.pointer_array_pool_used),
-              voxel_index_pool_size(other.voxel_index_pool_size),
-              voxel_index_pool_used(other.voxel_index_pool_used),
+            //   pointer_array_pool_size(other.pointer_array_pool_size),
+            //   pointer_array_pool_used(other.pointer_array_pool_used),
+            //   voxel_index_pool_size(other.voxel_index_pool_size),
+            //   voxel_index_pool_used(other.voxel_index_pool_used),
+              hierarchy_pool_size_bytes(other.hierarchy_pool_size_bytes),
+              hierarchy_pool_used_bytes(other.hierarchy_pool_used_bytes),
               voxel_storage(other.voxel_storage)
         {
             copy_memory_pools(other);
@@ -240,17 +240,18 @@ namespace vamp::collision
             const uint16_t min_z = static_cast<uint16_t>(std::max(0.0f, (grid_center_z_float - grid_query_radius)));
             const uint16_t max_z = static_cast<uint16_t>(std::min(static_cast<float>(grid_width - 1), (grid_center_z_float + grid_query_radius + ceil_hack)));
 
+            const uint8_t* hierarchy_base = hierarchy_pool.get();
             // Traverse three-level spatial hierarchy
             for (uint16_t voxel_x = min_x; voxel_x <= max_x; ++voxel_x) {
-                YLevelTable y_level_table = x_level_table[voxel_x];
-                if (y_level_table == nullptr) continue;
-                
+                if (x_level_table[voxel_x] == NULL_OFFSET) continue;
+                const TableOffset* y_table = reinterpret_cast<const TableOffset*>(hierarchy_base + x_level_table[voxel_x]);
+
                 for (uint16_t voxel_y = min_y; voxel_y <= max_y; ++voxel_y) {
-                    ZLevelTable z_level_table = y_level_table[voxel_y];
-                    if (z_level_table == nullptr) continue;
+                    if (y_table[voxel_y] == NULL_OFFSET) continue;
+                    const VoxelIndex* z_table = reinterpret_cast<const VoxelIndex*>(hierarchy_base + y_table[voxel_y]);
                     
                     for (uint16_t voxel_z = min_z; voxel_z <= max_z; ++voxel_z) {
-                        VoxelIndex voxel_index = z_level_table[voxel_z];
+                        VoxelIndex voxel_index = z_table[voxel_z];
                         if (voxel_index == INVALID_VOXEL_INDEX) continue;
                         
                         const Voxel& voxel = voxel_storage[voxel_index];
@@ -328,6 +329,7 @@ namespace vamp::collision
             const auto grid_y_array = grid_center_y.to_array();
             const auto grid_z_array = grid_center_z.to_array();
             
+            const uint8_t* hierarchy_base = hierarchy_pool.get();
             // Process each sphere individually
             for (size_t sphere_idx = 0; sphere_idx < SIMD_WIDTH; ++sphere_idx) {
                 // Skip spheres that failed global AABB test
@@ -355,12 +357,19 @@ namespace vamp::collision
 
                 // Traverse spatial hierarchy for this sphere
                 for (uint16_t voxel_x = min_x; voxel_x <= max_x; ++voxel_x) {
-                    YLevelTable y_level_table = x_level_table[voxel_x];
-                    if (y_level_table == nullptr) continue;
+                    // Level 1: Get Y-level table offset from X-level table
+                    TableOffset y_offset = x_level_table[voxel_x];
+                    if (y_offset == NULL_OFFSET) continue;
+                    // Resolve the actual pointer by adding the offset to the hierarchy base
+                    const TableOffset* y_level_table = reinterpret_cast<const TableOffset*>(hierarchy_base + y_offset);
                     
                     for (uint16_t voxel_y = min_y; voxel_y <= max_y; ++voxel_y) {
-                        ZLevelTable z_level_table = y_level_table[voxel_y];
-                        if (z_level_table == nullptr) continue;
+                        // Level 2: Get Z-level (voxel index) table offset from Y-level table
+                        TableOffset z_offset = y_level_table[voxel_y];
+                        if (z_offset == NULL_OFFSET) continue;
+                        
+                        // Resolve the actual pointer for the Z-level table
+                        const VoxelIndex* z_level_table = reinterpret_cast<const VoxelIndex*>(hierarchy_base + z_offset);
                         
                         for (uint16_t voxel_z = min_z; voxel_z <= max_z; ++voxel_z) {
                             VoxelIndex voxel_index = z_level_table[voxel_z];
@@ -457,64 +466,69 @@ namespace vamp::collision
 
         void initialize_memory_pools() {    
             initialize_point_coord_pool();
-            initialize_pointer_array_pool();
-            initialize_voxel_index_pool();
+            initialize_hierarchy_pool();
             initialize_voxel_storage();
         }
 
         void initialize_point_coord_pool() {
-            estimated_max_point_per_voxel = std::pow(max_query_radius / 0.02, 3.0f);
-
+            // 1. Calculate capacity per voxel (aligned to SIMD lanes)
             auto align_to_simd = [](size_t n) {
-                if (n == 0) return FVectorT::num_scalars;
-                return ((n + FVectorT::num_scalars - 1) / FVectorT::num_scalars) * FVectorT::num_scalars;
+                constexpr size_t WIDTH = FVectorT::num_scalars;
+                return ((n + WIDTH - 1) / WIDTH) * WIDTH;
             };
-            const unsigned int point_coord_array_in_bytes = align_to_simd(estimated_max_point_per_voxel) * sizeof(float);
-
-            size_t point_coord_pool_size_in_bytes = 
-                static_cast<size_t>(grid_width) * grid_width * grid_width * 0.1 * 
-                static_cast<size_t>(point_coord_array_in_bytes) * 3;
+        
+            // Estimation
+            size_t raw_estimate = static_cast<size_t>(std::pow(max_query_radius / 0.02f, 3.0f));
+            estimated_max_point_per_voxel = align_to_simd(raw_estimate);
+        
+            // 2. Calculate Total Pool Size
+            size_t total_voxels = static_cast<size_t>(grid_width) * grid_width * grid_width;
             
-            point_coord_pool_size = point_coord_pool_size_in_bytes / sizeof(float);
-            estimated_max_point_per_voxel = static_cast<size_t>(point_coord_array_in_bytes) / sizeof(float);
-
+            // Assume 10% occupancy and need 3 arrays (X, Y, Z) per voxel
+            double sparsity_factor = 0.1;
+            point_coord_pool_size = static_cast<size_t>(
+                total_voxels * sparsity_factor * estimated_max_point_per_voxel * 3
+            );
+        
+            // 3. Physical Allocation
+            size_t total_bytes = point_coord_pool_size * sizeof(float);
             void* raw_ptr = nullptr;
             
-            if (posix_memalign(&raw_ptr, 64, point_coord_pool_size_in_bytes) != 0) {
-                throw std::runtime_error("Failed to allocate aligned memory pool");
+            // Aligned to 64 bytes
+            if (posix_memalign(&raw_ptr, 64, total_bytes) != 0) {
+                throw std::runtime_error("Failed to allocate " + std::to_string(total_bytes) + " bytes");
             }
             
             point_coord_pool.reset(static_cast<float*>(raw_ptr));
+            point_coord_pool_used = 0; // Ensure reset
         }
 
-        void initialize_pointer_array_pool() {
-            const size_t estimated_tables = 1 + grid_width;
-            const size_t table_array_len_in_bytes = grid_width * sizeof(void*);
-            const size_t pointer_array_pool_size_in_bytes = estimated_tables * table_array_len_in_bytes;
-            
-            void* raw_ptr = nullptr;
-            if (posix_memalign(&raw_ptr, 64, pointer_array_pool_size_in_bytes) != 0) {
-                throw std::runtime_error("Failed to allocate aligned pointer array pool");
-            }
-            
-            pointer_array_pool.reset(static_cast<void**>(raw_ptr));
-            pointer_array_pool_size = pointer_array_pool_size_in_bytes / sizeof(void*);
-            table_array_len = static_cast<uint16_t>(table_array_len_in_bytes / sizeof(void*));
-        }
+        /**
+         * Initializes a unified memory pool for the X, Y, and Z level tables.
+         * Uses 32-bit offsets to save space and simplify memory relocation.
+         */
+        void initialize_hierarchy_pool() {
+            // 1. Estimate Pointer Table requirements (X and Y levels)
+            const size_t estimated_xy_tables = 1 + grid_width;
+            const size_t pointer_pool_bytes = estimated_xy_tables * grid_width * sizeof(TableOffset);
+            table_array_len = grid_width;
 
-        void initialize_voxel_index_pool() {
+            // 2. Estimate Voxel Index Table requirements (Z level)
             const size_t estimated_z_tables = static_cast<size_t>(grid_width) * grid_width * 0.5;
-            const size_t z_table_size_in_bytes = grid_width * sizeof(VoxelIndex);
-            const size_t voxel_index_pool_size_in_bytes = estimated_z_tables * z_table_size_in_bytes;
-            
+            const size_t z_table_pool_bytes = estimated_z_tables * grid_width * sizeof(VoxelIndex);
+            z_table_array_len = grid_width;
+
+            // 3. Calculate Total Size
+            hierarchy_pool_size_bytes = pointer_pool_bytes + z_table_pool_bytes;
+            hierarchy_pool_used_bytes = 0;
+
+            // 4. Allocate Aligned Memory
             void* raw_ptr = nullptr;
-            if (posix_memalign(&raw_ptr, 64, voxel_index_pool_size_in_bytes) != 0) {
-                throw std::runtime_error("Failed to allocate voxel index pool");
+            if (posix_memalign(&raw_ptr, 64, hierarchy_pool_size_bytes) != 0) {
+                throw std::runtime_error("Failed to allocate hierarchy pool");
             }
             
-            voxel_index_pool.reset(static_cast<VoxelIndex*>(raw_ptr));
-            voxel_index_pool_size = voxel_index_pool_size_in_bytes / sizeof(VoxelIndex);
-            z_table_array_len = static_cast<uint16_t>(z_table_size_in_bytes / sizeof(VoxelIndex));
+            hierarchy_pool.reset(static_cast<uint8_t*>(raw_ptr));
         }
 
         void initialize_voxel_storage() {
@@ -542,8 +556,9 @@ namespace vamp::collision
         
         void build_spatial_grid(const std::vector<Point>& points) {
             // Initialize root of three-level table hierarchy
-            x_level_table = allocate_pointer_table<XLevelTable>();
-            
+            TableOffset x_table_offset;
+            x_level_table = allocate_table<XLevelTable>(x_table_offset);
+
             // Insert each point into the corresponding voxel
             for (const auto& point : points) {
                 // Transform point coordinates to grid space
@@ -557,19 +572,19 @@ namespace vamp::collision
                 const uint16_t voxel_z = static_cast<uint16_t>(std::clamp(voxel_z_float, 0.0f, static_cast<float>(grid_width - 1)));
                 // Intervals are half-open [lower, upper) except for the last voxel
 
-                // Level 1: Get or create Y-level table
-                YLevelTable y_level_table = x_level_table[voxel_x];
-                if (y_level_table == nullptr) {
-                    y_level_table = allocate_pointer_table<YLevelTable>();
-                    x_level_table[voxel_x] = y_level_table;
+                // Level 1: Get Y-level
+                TableOffset y_offset = x_level_table[voxel_x];
+                if (y_offset == NULL_OFFSET) {
+                    allocate_table<YLevelTable>(x_level_table[voxel_x]);
                 }
-                
-                // Level 2: Get or create Z-level table (voxel index table)
-                ZLevelTable z_level_table = y_level_table[voxel_y];
-                if (z_level_table == nullptr) {
-                    z_level_table = allocate_index_table();
-                    y_level_table[voxel_y] = z_level_table;
+                YLevelTable y_level_table = reinterpret_cast<YLevelTable>(hierarchy_pool.get() + x_level_table[voxel_x]);
+
+                // Level 2: Get Z-level
+                TableOffset z_offset = y_level_table[voxel_y];
+                if (z_offset == NULL_OFFSET) {
+                    allocate_table<ZLevelTable>(y_level_table[voxel_y]);
                 }
+                ZLevelTable z_level_table = reinterpret_cast<ZLevelTable>(hierarchy_pool.get() + y_level_table[voxel_y]);
                 
                 // Level 3: Get or create voxel
                 VoxelIndex voxel_index = z_level_table[voxel_z];
@@ -616,25 +631,25 @@ namespace vamp::collision
         // ====================================================================
         
         template<typename T>
-        T allocate_pointer_table() {
-            if (pointer_array_pool_used + table_array_len > pointer_array_pool_size) {
-                throw std::runtime_error("Pointer array pool exhausted");
+        T allocate_table(TableOffset& out_offset) {
+            const size_t element_size = std::is_same_v<T, ZLevelTable> ? sizeof(VoxelIndex) : sizeof(TableOffset);
+            const size_t size_bytes = grid_width * element_size;
+            
+            if (hierarchy_pool_used_bytes + size_bytes > hierarchy_pool_size_bytes) {
+                std::cout << "try to allocate " << size_bytes << "bytes. Capacity: " << hierarchy_pool_size_bytes << "bytes" << std::endl;
+                throw std::runtime_error("hierarchy pool exhausted");
             }
             
-            T result = reinterpret_cast<T>(pointer_array_pool.get() + pointer_array_pool_used);
-            std::fill(result, result + table_array_len, nullptr);
-            pointer_array_pool_used += table_array_len;
-            return result;
-        }
-
-        ZLevelTable allocate_index_table() {
-            if (voxel_index_pool_used + z_table_array_len > voxel_index_pool_size) {
-                throw std::runtime_error("Voxel index pool exhausted");
+            out_offset = static_cast<TableOffset>(hierarchy_pool_used_bytes);
+            T result = reinterpret_cast<T>(hierarchy_pool.get() + hierarchy_pool_used_bytes);
+            
+            if constexpr (std::is_same_v<T, ZLevelTable>) {
+                std::fill(result, result + grid_width, INVALID_VOXEL_INDEX);
+            } else {
+                std::fill(result, result + grid_width, NULL_OFFSET);
             }
             
-            ZLevelTable result = voxel_index_pool.get() + voxel_index_pool_used;
-            std::fill(result, result + z_table_array_len, INVALID_VOXEL_INDEX);
-            voxel_index_pool_used += z_table_array_len;
+            hierarchy_pool_used_bytes += size_bytes;
             return result;
         }
 
@@ -655,8 +670,7 @@ namespace vamp::collision
         
         void copy_memory_pools(const MVT& other) {
             copy_point_coord_pool(other);
-            copy_pointer_array_pool(other);
-            copy_voxel_index_pool(other);
+            copy_hierarchy_pool(other);
         }
 
         void copy_point_coord_pool(const MVT& other) {
@@ -673,30 +687,20 @@ namespace vamp::collision
                        point_coord_pool_used * sizeof(float));
         }
 
-        void copy_pointer_array_pool(const MVT& other) {
-            if (!other.pointer_array_pool || other.pointer_array_pool_size == 0) return;
+        void copy_hierarchy_pool(const MVT& other) {
+            if (!other.hierarchy_pool || other.hierarchy_pool_size_bytes == 0) return;
             
             void* raw_ptr = nullptr;
-            if (posix_memalign(&raw_ptr, 64, pointer_array_pool_size * sizeof(void*)) != 0) {
-                throw std::runtime_error("Failed to allocate aligned pointer array pool");
+            // Allocate the same amount of memory as the original pool
+            if (posix_memalign(&raw_ptr, 64, other.hierarchy_pool_size_bytes) != 0) {
+                throw std::runtime_error("Failed to allocate aligned hierarchy pool during copy");
             }
             
-            pointer_array_pool.reset(static_cast<void**>(raw_ptr));
-            std::memcpy(pointer_array_pool.get(), other.pointer_array_pool.get(), 
-                       pointer_array_pool_used * sizeof(void*));
-        }
-
-        void copy_voxel_index_pool(const MVT& other) {
-            if (!other.voxel_index_pool || other.voxel_index_pool_size == 0) return;
+            hierarchy_pool.reset(static_cast<uint8_t*>(raw_ptr));
             
-            void* raw_ptr = nullptr;
-            if (posix_memalign(&raw_ptr, 64, voxel_index_pool_size * sizeof(VoxelIndex)) != 0) {
-                throw std::runtime_error("Failed to allocate voxel index pool");
-            }
-            
-            voxel_index_pool.reset(static_cast<VoxelIndex*>(raw_ptr));
-            std::memcpy(voxel_index_pool.get(), other.voxel_index_pool.get(), 
-                       voxel_index_pool_used * sizeof(VoxelIndex));
+            // Copy the actual data (the X, Y, and Z table offsets)
+            std::memcpy(hierarchy_pool.get(), other.hierarchy_pool.get(), 
+                       other.hierarchy_pool_used_bytes);
         }
 
         void update_pointers_after_copy(const MVT& other) {
@@ -705,40 +709,11 @@ namespace vamp::collision
         }
 
         void relocate_table_hierarchy(const MVT& other) {
-            const ptrdiff_t idx_pool_offset = reinterpret_cast<char*>(voxel_index_pool.get()) - 
-                                              reinterpret_cast<char*>(other.voxel_index_pool.get());
+            ptrdiff_t x_offset_in_pool = reinterpret_cast<uint8_t*>(other.x_level_table) - 
+                                         other.hierarchy_pool.get();
             
-            // Relocate root X-level table
-            ptrdiff_t x_table_offset = reinterpret_cast<void**>(other.x_level_table) - 
-                                       other.pointer_array_pool.get();
-            x_level_table = reinterpret_cast<XLevelTable>(pointer_array_pool.get() + x_table_offset);
-            
-            // Fix pointers in X and Y tables
-            for (size_t i = 0; i < table_array_len; ++i) {
-                if (x_level_table[i] != nullptr) {
-                    relocate_y_table(i, other, idx_pool_offset);
-                }
-            }
-        }
-
-        void relocate_y_table(size_t x_idx, const MVT& other, ptrdiff_t idx_pool_offset) {
-            YLevelTable old_y_ptr = x_level_table[x_idx];
-            ptrdiff_t y_offset = reinterpret_cast<void**>(old_y_ptr) - other.pointer_array_pool.get();
-            x_level_table[x_idx] = reinterpret_cast<YLevelTable>(pointer_array_pool.get() + y_offset);
-            
-            for (size_t j = 0; j < z_table_array_len; ++j) {
-                if (x_level_table[x_idx][j] != nullptr) {
-                    relocate_z_table(x_idx, j, other, idx_pool_offset);
-                }
-            }
-        }
-
-        void relocate_z_table(size_t x_idx, size_t y_idx, const MVT& other, ptrdiff_t idx_pool_offset) {
-            ZLevelTable old_z_ptr = x_level_table[x_idx][y_idx];
-            ptrdiff_t z_offset = reinterpret_cast<const char*>(old_z_ptr) - 
-                                reinterpret_cast<const char*>(other.voxel_index_pool.get());
-            x_level_table[x_idx][y_idx] = reinterpret_cast<ZLevelTable>(
-                reinterpret_cast<char*>(voxel_index_pool.get()) + z_offset);
+            x_level_table = reinterpret_cast<XLevelTable>(hierarchy_pool.get() + x_offset_in_pool);
+            // All internal offsets remain valid.
         }
 
         void relocate_voxel_coordinates(const MVT& other) {
@@ -770,147 +745,125 @@ namespace vamp::collision
             return n;
         }
 
-        void write_statistics(const std::string& filepath) const {
-            std::ofstream out(filepath);
+        [[nodiscard]] std::string get_robot_name() const {
+            // Small epsilon for float comparison
+            const float eps = 1e-3f;
+            
+            if (std::abs(max_query_radius - 0.07999999821186066) < eps &&
+                std::abs(min_query_radius - 0.014999999664723873) < eps) {
+                return "UR5";
+            } else if (std::abs(max_query_radius - 0.07999999821186066) < eps && 
+            std::abs(min_query_radius - 0.012000000104308128) < eps) {
+                return "Panda";
+            } else if (std::abs(max_query_radius - 0.23999999463558197) < eps &&
+                       std::abs(min_query_radius - 0.012000000104308128) < eps) {
+                return "Fetch";
+            }
+            return "UnknownRobot";
+        }
+
+        void record_mvt_state_to_file(const std::string& folder_path) const {
+            std::string robot_name = get_robot_name();
+            
+            // Generate timestamp
+            auto now = std::chrono::system_clock::now();
+            auto in_time_t = std::chrono::system_clock::to_time_t(now);
+            std::stringstream ss_filename;
+            
+            // Filename now includes the recognized robot name
+            ss_filename << folder_path << "/" << robot_name << "_mvt_report_" 
+                        << std::put_time(std::localtime(&in_time_t), "%Y%m%d_%H%M%S") << ".txt";
+            
+            std::ofstream out(ss_filename.str());
             if (!out.is_open()) {
-                throw std::runtime_error("Failed to open file: " + filepath);
+                throw std::runtime_error("Could not open file: " + ss_filename.str());
             }
-            
-            out << std::fixed << std::setprecision(6);
-            write_basic_info(out);
-            write_table_structure_stats(out);
-            write_memory_usage_stats(out);
-            write_efficiency_metrics(out);
-            
-            out.close();
-        }
-
-        void write_basic_info(std::ofstream& out) const {
-            out << "========================================\n";
-            out << "MVT STRUCTURE STATISTICS\n";
-            out << "========================================\n\n";
-            out << "--- Basic Information ---\n";
-            
-            Point workspace_size = {
-                workspace_aabb_max[0] - workspace_aabb_min[0],
-                workspace_aabb_max[1] - workspace_aabb_min[1],
-                workspace_aabb_max[2] - workspace_aabb_min[2]
+        
+            out << "========================================================\n";
+            out << "MVT REPORT FOR ROBOT: " << robot_name << "\n";
+            out << "========================================================\n\n";
+        
+            // --- METADATA ---
+            out << "[Metadata]\n";
+            out << "Robot Type:                     " << robot_name << "\n";
+            out << "Grid Width:                     " << grid_width << "x" << grid_width << "x" << grid_width << "\n";
+            out << "Inverse Scale Factor:           " << inverse_scale_factor << "\n";
+            out << "Point Radius:                   " << point_radius << "\n";
+            out << "Max Query Radius:               " << max_query_radius << "\n";
+            out << "Estimated Max_Point_Per_Voxel:  " << estimated_max_point_per_voxel << "\n";
+            out << "Voxel Count (Used):   " << voxel_storage.size() << "\n\n";
+        
+            // --- MEMORY CONSUMPTION & UNUSED SPACE ---
+            size_t point_used = point_coord_pool_used * sizeof(float);
+            size_t point_total = point_coord_pool_size * sizeof(float);
+            size_t hier_used = hierarchy_pool_used_bytes;
+            size_t hier_total = hierarchy_pool_size_bytes;
+            size_t voxel_meta = voxel_storage.size() * sizeof(Voxel);
+        
+            auto print_mem = [&](const std::string& label, size_t used, size_t total) {
+                out << label << ":\n";
+                out << "  Used:    " << std::fixed << std::setprecision(2) << used / 1024.0 << " KB\n";
+                out << "  Unused:  " << (total - used) / 1024.0 << " KB\n";
+                out << "  Efficiency: " << (total > 0 ? (used * 100.0 / total) : 0) << "%\n";
             };
-            
-            out << "Workspace AABB Size: [" << workspace_size[0] << ", " 
-                << workspace_size[1] << ", " << workspace_size[2] << "]\n";
-            out << "Query Radius Range: [" << min_query_radius << ", " << max_query_radius << "]\n";
-            out << "Point Radius: " << point_radius << "\n";
-            out << "Grid Width: " << static_cast<int>(grid_width) << "\n";
-            out << "Total Possible Voxels: " << (static_cast<int>(grid_width) * grid_width * grid_width) << "\n";
-            out << "Non-empty Voxels: " << voxel_storage.size() << "\n";
-            
-            write_point_statistics(out);
-        }
-
-        void write_point_statistics(std::ofstream& out) const {
-            size_t total_points = 0;
-            size_t max_points = 0;
-            size_t min_points = std::numeric_limits<size_t>::max();
-            
-            for (const auto& voxel : voxel_storage) {
-                total_points += voxel.point_count;
-                max_points = std::max(max_points, voxel.point_count);
-                if (voxel.point_count > 0) {
-                    min_points = std::min(min_points, voxel.point_count);
-                }
-            }
-            
-            out << "Total Points: " << total_points << "\n";
-            out << "Min Points in Voxel: " << (min_points == std::numeric_limits<size_t>::max() ? 0 : min_points) << "\n";
-            out << "Max Points in Voxel: " << max_points << "\n";
-            if (!voxel_storage.empty()) {
-                out << "Average Points Per Voxel: " << (static_cast<double>(total_points) / voxel_storage.size()) << "\n";
-            }
-        }
-
-        void write_table_structure_stats(std::ofstream& out) const {
-            out << "\n--- Three Level Table Structure ---\n";
-            
-            size_t non_empty_x = 0, non_empty_y = 0, non_empty_z = 0;
-            count_non_empty_tables(non_empty_x, non_empty_y, non_empty_z);
-            
-            out << "Non-empty X entries: " << non_empty_x << " / " << static_cast<int>(table_array_len) << "\n";
-            out << "Non-empty Y entries: " << non_empty_y << " (across all X)\n";
-            out << "Non-empty Z entries: " << non_empty_z << " (across all Y)\n";
-            out << "Table occupancy: " << (static_cast<double>(non_empty_z) / (grid_width * grid_width * grid_width) * 100.0) << "%\n";
-        }
-
-        void count_non_empty_tables(size_t& x_count, size_t& y_count, size_t& z_count) const {
-            for (size_t x = 0; x < table_array_len; ++x) {
-                if (x_level_table[x] != nullptr) {
-                    x_count++;
-                    YLevelTable y_table = x_level_table[x];
-                    
-                    for (size_t y = 0; y < table_array_len; ++y) {
-                        if (y_table[y] != nullptr) {
-                            y_count++;
-                            ZLevelTable z_table = y_table[y];
-                            
-                            for (size_t z = 0; z < z_table_array_len; ++z) {
-                                if (z_table[z] != INVALID_VOXEL_INDEX) {
-                                    z_count++;
-                                }
+        
+            out << "[Memory Analysis]\n";
+            print_mem("Point Coord Pool", point_used, point_total);
+            print_mem("Hierarchy Pool  ", hier_used, hier_total);
+            out << "Voxel Vector (Excluding pointed point coords):" << voxel_meta / 1024.0 << " KB\n";
+            out << "Total Footprint:  " << (point_total + hier_total + voxel_meta) / 1024.0 << " KB\n\n";
+        
+            // --- HIERARCHY STATISTICS ---
+            size_t x_entries = 0, y_entries = 0, z_entries = 0;
+            const uint8_t* base = hierarchy_pool.get();
+        
+            for (uint16_t x = 0; x < grid_width; ++x) {
+                if (x_level_table[x] != NULL_OFFSET) {
+                    x_entries++;
+                    const TableOffset* y_table = reinterpret_cast<const TableOffset*>(base + x_level_table[x]);
+                    for (uint16_t y = 0; y < grid_width; ++y) {
+                        if (y_table[y] != NULL_OFFSET) {
+                            y_entries++;
+                            const VoxelIndex* z_table = reinterpret_cast<const VoxelIndex*>(base + y_table[y]);
+                            for (uint16_t z = 0; z < grid_width; ++z) {
+                                if (z_table[z] != INVALID_VOXEL_INDEX) z_entries++;
                             }
                         }
                     }
                 }
             }
-        }
+        
+            out << "[Structure Stats]\n";
+            out << "Table Occupancy: X=" << x_entries << ", Y=" << y_entries << ", Z=" << z_entries << "\n";
+    
+            double x_null_rate = 100.0 * (1.0 - (static_cast<double>(x_entries) / grid_width));
+            // Only calculate Y and Z if their parents exist to avoid Division by Zero
+            double y_null_rate = (x_entries > 0) ? 
+                100.0 * (1.0 - (static_cast<double>(y_entries) / (x_entries * grid_width))) : 100.0;
+            double z_null_rate = (y_entries > 0) ? 
+                100.0 * (1.0 - (static_cast<double>(z_entries) / (y_entries * grid_width))) : 100.0;
 
-        void write_memory_usage_stats(std::ofstream& out) const {
-            out << "\n--- Memory Pool Usage ---\n";
-            
-            write_pool_stats(out, "Point Coordinate Pool",
-                           point_coord_pool_size * sizeof(float),
-                           point_coord_pool_used * sizeof(float));
-            
-            write_pool_stats(out, "Pointer Array Pool",
-                           pointer_array_pool_size * sizeof(void*),
-                           pointer_array_pool_used * sizeof(void*));
-            
-            write_pool_stats(out, "Voxel Index Pool",
-                           voxel_index_pool_size * sizeof(VoxelIndex),
-                           voxel_index_pool_used * sizeof(VoxelIndex));
-            
-            size_t voxel_struct_bytes = voxel_storage.size() * sizeof(Voxel);
-            size_t voxel_capacity_bytes = voxel_storage.capacity() * sizeof(Voxel);
-            out << "Voxel Storage (metadata):\n";
-            out << "  Used: " << voxel_struct_bytes << " bytes (" << (voxel_struct_bytes / 1024.0) << " KB)\n";
-            out << "  Capacity: " << voxel_capacity_bytes << " bytes (" << (voxel_capacity_bytes / 1024.0) << " KB)\n";
-        }
-
-        void write_pool_stats(std::ofstream& out, const std::string& name, 
-                            size_t allocated, size_t used) const {
-            double usage_pct = allocated > 0 ? (static_cast<double>(used) / allocated) * 100.0 : 0.0;
-            
-            out << name << ":\n";
-            out << "  Allocated: " << allocated << " bytes (" << (allocated / (1024.0 * 1024.0)) << " MB)\n";
-            out << "  Used: " << used << " bytes (" << (used / (1024.0 * 1024.0)) << " MB)\n";
-            out << "  Usage: " << usage_pct << "%\n";
-        }
-
-        void write_efficiency_metrics(std::ofstream& out) const {
-            out << "\n--- Efficiency Metrics ---\n";
-            
-            size_t total_points = std::accumulate(voxel_storage.begin(), voxel_storage.end(), 0UL,
-                [](size_t sum, const Voxel& v) { return sum + v.point_count; });
-            
-            size_t total_memory = point_coord_pool_size * sizeof(float) + 
-                                 pointer_array_pool_size + 
-                                 voxel_index_pool_size * sizeof(VoxelIndex) +
-                                 voxel_storage.capacity() * sizeof(Voxel);
-            
-            if (total_points > 0) {
-                out << "Bytes per point: " << (static_cast<double>(total_memory) / total_points) << "\n";
+            out << "NULL_OFFSET Rate (Sparsity):\n"
+                << "  X-Level: " << std::fixed << std::setprecision(2) << x_null_rate << "%\n"
+                << "  Y-Level: " << y_null_rate << "%\n"
+                << "  Z-Level: " << z_null_rate << "%\n\n";
+                
+            // --- PARTIAL VISUALIZATION ---
+            out << "[Sampled Hierarchy Visualization (First 3 X-Slices)]\n";
+            int count = 0;
+            for (uint16_t x = 0; x < grid_width && count < 3; ++x) {
+                if (x_level_table[x] == NULL_OFFSET) continue;
+                out << "X[" << x << "]: ";
+                const TableOffset* y_table = reinterpret_cast<const TableOffset*>(base + x_level_table[x]);
+                for (uint16_t y = 0; y < grid_width; ++y) {
+                    if (y_table[y] != NULL_OFFSET) out << "Y" << y << " ";
+                }
+                out << "\n";
+                count++;
             }
-            
-            out << "\n========================================\n";
+        
+            out.close();
         }
+
     };
 }  // namespace vamp::collision
