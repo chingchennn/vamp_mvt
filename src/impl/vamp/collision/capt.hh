@@ -10,6 +10,7 @@
 #include <cassert>
 #include <fstream> 
 #include <sstream> 
+#include <iomanip>
 
 #include <pdqsort.h>
 
@@ -366,6 +367,7 @@ namespace vamp::collision
                     0u});
 
             // benchmark_collision_queries("../cc_queries_capt.txt");
+            // record_capt_state_to_file("scripts/log/");
         }
 
         //  Test whether a sphere centered at `center` with radius-squared `radius_sq` collides with any
@@ -814,6 +816,96 @@ namespace vamp::collision
                         << std::endl;
                 log_file.close();
             }
+        }
+        void record_capt_state_to_file(const std::string& folder_path) const {
+            // 1. Identify Robot (using logic similar to your baseline)
+            auto get_robot_name = [&]() -> std::string {
+                const float eps = 1e-3f;
+                if (std::abs(r_max - 0.08f) < eps && std::abs(r_min - 0.015f) < eps) return "ur5";
+                if (std::abs(r_max - 0.08f) < eps && std::abs(r_min - 0.012f) < eps) return "panda";
+                if (std::abs(r_max - 0.24f) < eps && std::abs(r_min - 0.012f) < eps) return "fetch";
+                return "UnknownRobot";
+            };
+        
+            std::string robot_name = get_robot_name();
+            
+            // 2. Generate Filename
+            auto now = std::chrono::system_clock::now();
+            auto in_time_t = std::chrono::system_clock::to_time_t(now);
+            std::stringstream ss_filename;
+            ss_filename << folder_path << "/" << robot_name << "_capt_report_" 
+                        << std::put_time(std::localtime(&in_time_t), "%Y%m%d_%H%M%S") << ".txt";
+            
+            std::ofstream out(ss_filename.str());
+            if (!out.is_open()) return;
+        
+            out << "========================================================\n";
+            out << "CAPT REPORT FOR ROBOT: " << robot_name << "\n";
+            out << "========================================================\n\n";
+        
+            // --- METADATA ---
+            size_t num_leaves = (1ULL << nlog2);
+            out << "[Metadata]\n";
+            out << "Tree Depth (nlog2):             " << (int)nlog2 << "\n";
+            out << "Leaf Nodes (Calculated):        " << num_leaves << "\n";
+            out << "Point Radius (r_point):         " << r_point << "\n";
+            out << "Query Range (r_min - r_max):    " << r_min << " - " << r_max << "\n\n";
+        
+            // --- MEMORY CONSUMPTION ---
+            // Calculate memory for vectors (Size vs Capacity)
+            auto vec_mem = [](const auto& v) { 
+                return std::make_pair(v.size() * sizeof(typename std::decay_t<decltype(v)>::value_type),
+                                      v.capacity() * sizeof(typename std::decay_t<decltype(v)>::value_type));
+            };
+        
+            auto [tests_used, tests_total] = vec_mem(tests);
+            auto [starts_used, starts_total] = vec_mem(aff_starts);
+            auto [aabbs_used, aabbs_total] = vec_mem(aabbs);
+            
+            // Affordances is an array of 3 vectors
+            size_t aff_used = 0, aff_total = 0;
+            for(int i=0; i<3; ++i) {
+                auto [u, t] = vec_mem(affordances[i]);
+                aff_used += u; aff_total += t;
+            }
+        
+            auto print_line = [&](const std::string& label, size_t used, size_t total) {
+                out << label << ":\n";
+                out << "  Used:     " << std::fixed << std::setprecision(2) << used / 1024.0 << " KB\n";
+                out << "  Reserved: " << total / 1024.0 << " KB\n";
+                out << "  Waste:    " << (total - used) / 1024.0 << " KB\n";
+            };
+        
+            out << "[Memory Analysis]\n";
+            print_line("Tests (Internal Nodes) ", tests_used, tests_total);
+            print_line("Affordance Buffers     ", aff_used, aff_total);
+            print_line("Leaf AABBs             ", aabbs_used, aabbs_total);
+            print_line("Start Indices          ", starts_used, starts_total);
+            
+            size_t total_footprint = tests_total + aff_total + aabbs_total + starts_total;
+            out << "\nTotal Footprint: " << total_footprint / 1024.0 << " KB (" 
+                << total_footprint / (1024.0 * 1024.0) << " MB)\n\n";
+        
+            // --- STRUCTURE STATISTICS ---
+            // Count how many "afforded" points actually exist
+            // Each FVectorT contains num_scalars elements
+            size_t total_simd_blocks = affordances[0].size();
+            size_t total_potential_points = total_simd_blocks * FVectorT::num_scalars;
+            
+            out << "[Structure Stats]\n";
+            out << "Total SIMD Blocks:       " << total_simd_blocks << "\n";
+            out << "Points Stored (Packed):  " << total_potential_points << "\n";
+            
+            // Calculate average affordance list length
+            double avg_aff = 0;
+            if (num_leaves > 0) {
+                // aff_starts[z+1] - aff_starts[z] gives blocks per leaf
+                size_t total_blocks = aff_starts.back(); 
+                avg_aff = static_cast<double>(total_blocks) / num_leaves;
+            }
+            out << "Avg SIMD Blocks/Leaf:    " << std::fixed << std::setprecision(2) << avg_aff << "\n";
+        
+            out.close();
         }
         
     };  // namespace vamp::collision
