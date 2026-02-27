@@ -19,7 +19,7 @@ namespace vamp::collision
         float stored_point_dist_sq = 0.0f;
         bool occupied = false;
         
-        void set_voxel_center(uint8_t vx, uint8_t vy, uint8_t vz, float voxel_size, Point workspace_min) {
+        void set_voxel_center(uint16_t vx, uint16_t vy, uint16_t vz, float voxel_size, Point workspace_min) {
             voxel_center[0] = workspace_min[0] + (vx + 0.5f) * voxel_size;
             voxel_center[1] = workspace_min[1] + (vy + 0.5f) * voxel_size;
             voxel_center[2] = workspace_min[2] + (vz + 0.5f) * voxel_size;
@@ -43,96 +43,93 @@ namespace vamp::collision
     };
 
     struct CenterSelectiveVoxelFilter {
-        static constexpr uint8_t INVALID_INDEX = 255;
-        static constexpr uint8_t MAX_GRID_SIZE = 255;
-        static constexpr uint8_t MAX_VOXEL_PER_Z_TABLE = 255;
-        static constexpr uint8_t INDEX_ARRAY_LEN = 255;
-
-        struct ZLevelTable {
-            Voxel* voxels[MAX_VOXEL_PER_Z_TABLE];
-            uint8_t voxel_count = 0;     
-            uint8_t z_coord_to_voxel_idx[INDEX_ARRAY_LEN];
-            
-            ZLevelTable() {
-                std::fill(z_coord_to_voxel_idx, z_coord_to_voxel_idx + INDEX_ARRAY_LEN, INVALID_INDEX);
-            }
-        };
+        using TableOffset = uint32_t;
+        static constexpr TableOffset NULL_OFFSET = std::numeric_limits<TableOffset>::max();
         
-        struct YLevelTable {
-            std::vector<ZLevelTable> z_tables;
-            uint8_t y_coord_to_z_table_idx[INDEX_ARRAY_LEN];
-            
-            YLevelTable() {
-                std::fill(y_coord_to_z_table_idx, y_coord_to_z_table_idx + INDEX_ARRAY_LEN, INVALID_INDEX);
-                z_tables.reserve(32);
-            }
-        };
+        // ====================================================================
+        // MEMBER VARIABLES
+        // ====================================================================
 
-        struct XLevelTable {
-            std::vector<YLevelTable> y_tables;
-            uint8_t x_coord_to_y_table_idx[INDEX_ARRAY_LEN];
-            
-            XLevelTable() {
-                std::fill(x_coord_to_y_table_idx, x_coord_to_y_table_idx + INDEX_ARRAY_LEN, INVALID_INDEX);
-                y_tables.reserve(32);
-            }
-        };
+        std::unique_ptr<uint8_t[], decltype(&std::free)> hierarchy_pool{nullptr, &std::free};
+        size_t hierarchy_pool_size = 0;
+        size_t hierarchy_pool_used = 0;
+        TableOffset x_level_table_offset = NULL_OFFSET;
 
-        XLevelTable x_level_table;
+        std::unique_ptr<Voxel[], decltype(&std::free)> voxel_pool{nullptr, &std::free};
+        size_t voxel_pool_size = 0;
+        size_t allocated_voxel_count = 0;
+        
         Point workspace_aabb_min;
-        Point workspace_aabb_max;
+        Point origin_point;
         float inverse_scale_factor;
         float voxel_size;
         float max_range_sq;
-        Point origin_point;
+        uint16_t grid_width;
         
-        // Voxel memory management
-        std::unique_ptr<Voxel[], decltype(&std::free)> voxel_pool{nullptr, &std::free};
-        size_t voxel_pool_size;
-        size_t allocated_voxel_count = 0;
-
+        // ====================================================================
+        // CONSTRUCTOR
+        // ====================================================================
+        
         CenterSelectiveVoxelFilter(float voxel_sz, float max_range, Point origin, 
                                   Point workspace_min, Point workspace_max)
-            : workspace_aabb_min(workspace_min), workspace_aabb_max(workspace_max),
+            : workspace_aabb_min(workspace_min),
               voxel_size(voxel_sz), max_range_sq(max_range * max_range), 
               origin_point(origin)
         {
             const float workspace_width = std::max({
-                workspace_aabb_max[0] - workspace_aabb_min[0],
-                workspace_aabb_max[1] - workspace_aabb_min[1], 
-                workspace_aabb_max[2] - workspace_aabb_min[2]
+                workspace_max[0] - workspace_min[0],
+                workspace_max[1] - workspace_min[1], 
+                workspace_max[2] - workspace_min[2]
             });
             
-            const int grid_width = std::min(static_cast<int>(MAX_GRID_SIZE), 
-                                          static_cast<int>(std::ceil(workspace_width / voxel_size)));
+            grid_width = static_cast<uint16_t>(std::ceil(workspace_width / voxel_size));
+            inverse_scale_factor = 1.0 / voxel_size;
             
-            inverse_scale_factor = grid_width / workspace_width;
-            
-            // Estimated voxel pool size: (workspace_width/voxel_size)^3 * 0.05
-            const float voxels_per_dimension = workspace_width / voxel_size;
-            const size_t estimated_voxels = static_cast<size_t>(
-                std::pow(voxels_per_dimension, 3.0f) * 0.05f
-            );
-            
-            voxel_pool_size = std::min(estimated_voxels, size_t(32768));
-            
-            // Allocate aligned memory for voxels
-            void* raw_memory = nullptr;
-            int result = posix_memalign(&raw_memory, 32, sizeof(Voxel) * voxel_pool_size); // sizeof(Voxel): 32 bytes
-            if (result != 0 || raw_memory == nullptr) {
+            // Estimated hierarchy pool size
+            size_t table_size = grid_width * sizeof(TableOffset);
+            size_t estimated_tables = 1 + grid_width + static_cast<size_t>(grid_width * grid_width * 0.3);
+            hierarchy_pool_size = estimated_tables * table_size;
+            // Allocate hierarchy pool
+            void* h_ptr = nullptr;
+            int result = posix_memalign(&h_ptr, 64, hierarchy_pool_size);
+            if (result != 0 || h_ptr == nullptr) {
                 throw std::bad_alloc();
             }
-
-            voxel_pool.reset(static_cast<Voxel*>(raw_memory));
-        }
-        
-        Voxel* allocate_voxel() {
-            if (allocated_voxel_count >= voxel_pool_size) {
-                throw std::runtime_error("Voxel pool exhausted");
-            }
+            hierarchy_pool.reset(static_cast<uint8_t*>(h_ptr));
+            std::memset(hierarchy_pool.get(), 0xFF, hierarchy_pool_size); // Init to NULL_OFFSET
             
-            // Append-only allocation
-            return new(&voxel_pool[allocated_voxel_count++]) Voxel();
+            // Estimated voxel pool size
+            voxel_pool_size = static_cast<size_t>(std::pow(grid_width, 3.0f) * 0.05f);
+            
+            // Allocate voxel pool
+            void* v_ptr = nullptr;
+            result = posix_memalign(&v_ptr, 64, sizeof(Voxel) * voxel_pool_size); // sizeof(Voxel): 32 bytes
+            if (result != 0 || v_ptr == nullptr) {
+                throw std::bad_alloc();
+            }
+            voxel_pool.reset(static_cast<Voxel*>(v_ptr));
+
+            allocate_table(x_level_table_offset);
+        }
+
+        // ====================================================================
+        // CORE LOGIC
+        // ====================================================================
+        
+        TableOffset* get_table_ptr(TableOffset offset) const {
+            return reinterpret_cast<TableOffset*>(hierarchy_pool.get() + offset);
+        }
+
+        bool allocate_table(TableOffset& out_offset) {
+            size_t size = grid_width * sizeof(TableOffset);
+            if (hierarchy_pool_used + size > hierarchy_pool_size) {
+                std::cerr << "Table Allocation Failed!" << std::endl;
+                return false;
+            }
+            out_offset = static_cast<TableOffset>(hierarchy_pool_used);
+            std::memset(hierarchy_pool.get() + out_offset, 0xFF, size); // Set to NULL_OFFSET
+            hierarchy_pool_used += size;
+            return true;
         }
 
         bool try_insert_point(const Point& point) {
@@ -140,133 +137,63 @@ namespace vamp::collision
             const float dx = point[0] - origin_point[0];
             const float dy = point[1] - origin_point[1];
             const float dz = point[2] - origin_point[2];
-            if (dx*dx + dy*dy + dz*dz >= max_range_sq) return false;
-
-            if (point[0] < workspace_aabb_min[0] || point[0] > workspace_aabb_max[0] ||
-                point[1] < workspace_aabb_min[1] || point[1] > workspace_aabb_max[1] ||
-                point[2] < workspace_aabb_min[2] || point[2] > workspace_aabb_max[2]) {
+            if (dx*dx + dy*dy + dz*dz >= max_range_sq) {
+                // std::cout << "Culled by distance" << std::endl;
                 return false;
             }
+            int ivx = static_cast<int>((point[0] - workspace_aabb_min[0]) * inverse_scale_factor);
+            int ivy = static_cast<int>((point[1] - workspace_aabb_min[1]) * inverse_scale_factor);
+            int ivz = static_cast<int>((point[2] - workspace_aabb_min[2]) * inverse_scale_factor);
+            if (static_cast<uint32_t>(ivx) >= static_cast<uint32_t>(grid_width) ||
+                static_cast<uint32_t>(ivy) >= static_cast<uint32_t>(grid_width) ||
+                static_cast<uint32_t>(ivz) >= static_cast<uint32_t>(grid_width)) {
+                // std::cout << "Outside of grid\n" << std::endl;
+                return false;
+            }
+            const uint16_t vx = static_cast<uint16_t>(ivx);
+            const uint16_t vy = static_cast<uint16_t>(ivy);
+            const uint16_t vz = static_cast<uint16_t>(ivz);
+            // Traverse three-level tables
+            TableOffset* x_table = get_table_ptr(x_level_table_offset);
+        
+            if (x_table[vx] == NULL_OFFSET) {
+                if (!allocate_table(x_table[vx])) return false;
+            }
+            
+            TableOffset* y_table = get_table_ptr(x_table[vx]);
+            if (y_table[vy] == NULL_OFFSET) {
+                if (!allocate_table(y_table[vy])) return false;
+            }
+    
+            TableOffset* z_table = get_table_ptr(y_table[vy]);
+            
+            TableOffset& voxel_idx = z_table[vz];
+            if (voxel_idx == NULL_OFFSET) {
+                if (allocated_voxel_count >= voxel_pool_size) {
+                    std::cerr << "Voxel Pool Full!" << std::endl;
+                    return false;
+                }
+                
+                voxel_idx = static_cast<TableOffset>(allocated_voxel_count++);
+                Voxel* v = &voxel_pool[voxel_idx];
+                new(v) Voxel(); // Placement new
+                v->set_voxel_center(vx, vy, vz, voxel_size, workspace_aabb_min);
+            }
 
-            // Convert to voxel coordinates
-            const uint8_t vx = static_cast<uint8_t>(std::clamp(
-                static_cast<int>((point[0] - workspace_aabb_min[0]) * inverse_scale_factor), 
-                0, MAX_GRID_SIZE - 1));
-            const uint8_t vy = static_cast<uint8_t>(std::clamp(
-                static_cast<int>((point[1] - workspace_aabb_min[1]) * inverse_scale_factor), 
-                0, MAX_GRID_SIZE - 1));
-            const uint8_t vz = static_cast<uint8_t>(std::clamp(
-                static_cast<int>((point[2] - workspace_aabb_min[2]) * inverse_scale_factor), 
-                0, MAX_GRID_SIZE - 1));
-
-            return insert_to_voxel(vx, vy, vz, point);
+            return voxel_pool[voxel_idx].try_insert(point);
         }
 
         std::vector<Point> extract_points() const {
             std::vector<Point> result;
             result.reserve(allocated_voxel_count);
         
-            for (const auto& y_table : x_level_table.y_tables) {
-                for (const auto& z_table : y_table.z_tables) {
-                    for (uint8_t i = 0; i < z_table.voxel_count; ++i) {
-                        const Voxel* voxel = z_table.voxels[i];
-                        if (voxel->occupied) {
-                            result.push_back(voxel->stored_point);
-                        }
-                    }
+            for (size_t i = 0; i < allocated_voxel_count; ++i) {
+                if (voxel_pool[i].occupied) {
+                    result.push_back(voxel_pool[i].stored_point);
                 }
             }
             
             return result;
-        }
-
-        // Visualization and debugging
-        void visualize_summary() const {
-            uint32_t total_y_tables = x_level_table.y_tables.size();
-            uint32_t total_z_tables = 0;
-            uint32_t total_voxels = 0;
-            uint32_t occupied_voxels = 0;
-            uint32_t max_z_tables_per_y = 0;
-            uint32_t max_voxels_per_z = 0;
-            
-            for (const auto& y_table : x_level_table.y_tables) {
-                total_z_tables += y_table.z_tables.size();
-                max_z_tables_per_y = std::max(max_z_tables_per_y, 
-                                            static_cast<uint32_t>(y_table.z_tables.size()));
-                
-                for (const auto& z_table : y_table.z_tables) {
-                    total_voxels += z_table.voxel_count;
-                    max_voxels_per_z = std::max(max_voxels_per_z,
-                                              static_cast<uint32_t>(z_table.voxel_count));
-                    
-                    for (uint8_t i = 0; i < z_table.voxel_count; ++i) {
-                        if (z_table.voxels[i]->occupied) {
-                            occupied_voxels++;
-                        }
-                    }
-                }
-            }
-            
-            printf("=== CenterSelectiveVoxelFilter Summary ===\n");
-            printf("Structure: %u Y-tables, %u Z-tables, %u voxels (%u occupied)\n",
-                total_y_tables, total_z_tables, total_voxels, occupied_voxels);
-            printf("Pool: %zu/%zu allocated (%.1f%%)\n", 
-                allocated_voxel_count, voxel_pool_size, (allocated_voxel_count * 100.0f) / voxel_pool_size);
-            printf("Max utilization: %u Z-tables/Y, %u voxels/Z\n", 
-                max_z_tables_per_y, max_voxels_per_z);
-            printf("Workspace: (%.3f,%.3f,%.3f) to (%.3f,%.3f,%.3f), voxel_size=%.6f\n",
-                workspace_aabb_min[0], workspace_aabb_min[1], workspace_aabb_min[2],
-                workspace_aabb_max[0], workspace_aabb_max[1], workspace_aabb_max[2], voxel_size);
-        }
-
-        void test_point_roundtrip(size_t input_pc_size) const {
-            auto extracted = extract_points();
-            printf("=== Point Roundtrip Test ===\n");
-            printf("Input: %zu points, Output: %zu points (%.2f%% compression)\n", 
-                input_pc_size, extracted.size(),
-                (extracted.size() * 100.0f) / input_pc_size);
-        }
-
-        size_t get_allocated_voxel_count() const { return allocated_voxel_count; }
-        size_t get_max_capacity() const { return voxel_pool_size; }
-
-    private:
-        bool insert_to_voxel(uint8_t voxel_x, uint8_t voxel_y, uint8_t voxel_z, const Point& point) {
-            // Level 1: Get or create Y-level table for X coordinate
-            uint8_t& y_level_index = x_level_table.x_coord_to_y_table_idx[voxel_x];
-            if (y_level_index == INVALID_INDEX) {
-                y_level_index = static_cast<uint8_t>(x_level_table.y_tables.size());
-                x_level_table.y_tables.emplace_back();
-            }
-            
-            auto& y_level_table = x_level_table.y_tables[y_level_index];
-            
-            // Level 2: Get or create Z-level table for Y coordinate
-            uint8_t& z_level_index = y_level_table.y_coord_to_z_table_idx[voxel_y];
-            if (z_level_index == INVALID_INDEX) {
-                z_level_index = static_cast<uint8_t>(y_level_table.z_tables.size());
-                y_level_table.z_tables.emplace_back();
-            }
-            
-            auto& z_level_table = y_level_table.z_tables[z_level_index];
-            
-            // Level 3: Get or create voxel for Z coordinate
-            uint8_t& voxel_index = z_level_table.z_coord_to_voxel_idx[voxel_z];
-            if (voxel_index == INVALID_INDEX) {
-                if (z_level_table.voxel_count >= MAX_VOXEL_PER_Z_TABLE) {
-                    throw std::runtime_error("Z-table capacity exceeded");
-                }
-
-                Voxel* new_voxel = allocate_voxel();
-
-                voxel_index = z_level_table.voxel_count++;
-                z_level_table.voxels[voxel_index] = new_voxel;
-                
-                // Set voxel center coordinates
-                new_voxel->set_voxel_center(voxel_x, voxel_y, voxel_z, voxel_size, workspace_aabb_min);
-            }
-            
-            return z_level_table.voxels[voxel_index]->try_insert(point);
         }
     };
     
