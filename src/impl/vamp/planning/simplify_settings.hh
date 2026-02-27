@@ -42,7 +42,7 @@ namespace vamp::planning
     {
         std::size_t max_iterations{5};
         std::size_t interpolate{0};
-        std::vector<SimplifyRoutine> operations{{SHORTCUT, BSPLINE}};
+        std::vector<SimplifyRoutine> operations{{SHORTCUT}};
 
         ReduceSettings reduce;
         ShortcutSettings shortcut;
