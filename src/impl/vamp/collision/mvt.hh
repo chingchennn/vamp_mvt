@@ -17,6 +17,9 @@
 #include <vamp/collision/math.hh>
 #include <vamp/vector.hh>
 
+// #define BENCHMARK_CC
+// #define PRINT_CC
+
 namespace vamp::collision
 {
     /**
@@ -122,6 +125,7 @@ namespace vamp::collision
         
         // Grid configuration
         float inverse_scale_factor;
+        float voxel_size;
         uint16_t grid_width;
         uint16_t table_array_len;
         uint16_t z_table_array_len;
@@ -168,11 +172,21 @@ namespace vamp::collision
             }
             
             configure_grid();
-            initialize_memory_pools();
-            build_spatial_grid(points);
+            initialize_hierarchy_pool();
+            initialize_voxel_storage();
+            build_spatial_grid_two_phase(points);
             compute_global_bounds();
             setup_simd_vectors();
             // record_mvt_state_to_file("scripts/log/");
+#ifdef BENCHMARK_CC
+            for (int i = 1; i <= 99; ++i) {
+                std::string filePath = "scripts/log/queries/box_" + std::to_string(i) + "_fetch_mvt_queries.txt";
+                
+                std::cout << "Processing: " << filePath << "..." << std::endl;
+                
+                benchmark_collision_queries(filePath);
+            }
+#endif
         }
 
         MVT(const MVT& other)
@@ -184,16 +198,13 @@ namespace vamp::collision
               global_aabb_min(other.global_aabb_min),
               global_aabb_max(other.global_aabb_max),
               inverse_scale_factor(other.inverse_scale_factor),
+              voxel_size(other.voxel_size),
               grid_width(other.grid_width),
               table_array_len(other.table_array_len),
               z_table_array_len(other.z_table_array_len),
               point_coord_pool_size(other.point_coord_pool_size),
               point_coord_pool_used(other.point_coord_pool_used),
               estimated_max_point_per_voxel(other.estimated_max_point_per_voxel),
-            //   pointer_array_pool_size(other.pointer_array_pool_size),
-            //   pointer_array_pool_used(other.pointer_array_pool_used),
-            //   voxel_index_pool_size(other.voxel_index_pool_size),
-            //   voxel_index_pool_used(other.voxel_index_pool_used),
               hierarchy_pool_size_bytes(other.hierarchy_pool_size_bytes),
               hierarchy_pool_used_bytes(other.hierarchy_pool_used_bytes),
               voxel_storage(other.voxel_storage)
@@ -232,13 +243,12 @@ namespace vamp::collision
             const float grid_center_z_float = (center[2] - workspace_aabb_min[2]) * inverse_scale_factor;
             
             //Calculate voxel iteration bounds
-            const float ceil_hack = 0.9999f;
             const uint16_t min_x = static_cast<uint16_t>(std::max(0.0f, (grid_center_x_float - grid_query_radius)));
-            const uint16_t max_x = static_cast<uint16_t>(std::min(static_cast<float>(grid_width - 1), (grid_center_x_float + grid_query_radius + ceil_hack)));
+            const uint16_t max_x = static_cast<uint16_t>(std::min(static_cast<float>(grid_width - 1), (grid_center_x_float + grid_query_radius)));
             const uint16_t min_y = static_cast<uint16_t>(std::max(0.0f, (grid_center_y_float - grid_query_radius)));
-            const uint16_t max_y = static_cast<uint16_t>(std::min(static_cast<float>(grid_width - 1), (grid_center_y_float + grid_query_radius + ceil_hack)));
+            const uint16_t max_y = static_cast<uint16_t>(std::min(static_cast<float>(grid_width - 1), (grid_center_y_float + grid_query_radius)));
             const uint16_t min_z = static_cast<uint16_t>(std::max(0.0f, (grid_center_z_float - grid_query_radius)));
-            const uint16_t max_z = static_cast<uint16_t>(std::min(static_cast<float>(grid_width - 1), (grid_center_z_float + grid_query_radius + ceil_hack)));
+            const uint16_t max_z = static_cast<uint16_t>(std::min(static_cast<float>(grid_width - 1), (grid_center_z_float + grid_query_radius)));
 
             const uint8_t* hierarchy_base = hierarchy_pool.get();
             // Traverse three-level spatial hierarchy
@@ -289,6 +299,9 @@ namespace vamp::collision
         auto inline collides_simd(const std::array<FVectorT, 3> &centers, 
                                 FVectorT radii) const noexcept -> bool
         {
+#ifdef PRINT_CC
+            print_simd_args(centers, radii);
+#endif
             constexpr size_t SIMD_WIDTH = FVectorT::num_scalars;
 
             // Compute query radii for all spheres
@@ -341,19 +354,20 @@ namespace vamp::collision
                 const Point center = {centers_x_array[sphere_idx], centers_y_array[sphere_idx], centers_z_array[sphere_idx]};
                 const float query_radius = query_radii_array[sphere_idx];
                 const float query_radius_squared = query_radii_squared_array[sphere_idx];
-                const float grid_query_radius = std::min(1.0f, query_radius * inverse_scale_factor);
+                const float grid_query_radius = query_radius * inverse_scale_factor;
+                // const float grid_query_radius = std::min(1.0f, query_radius * inverse_scale_factor);
                 const float grid_center_x_float = grid_x_array[sphere_idx];
                 const float grid_center_y_float = grid_y_array[sphere_idx];
                 const float grid_center_z_float = grid_z_array[sphere_idx];
                 
                 // Calculate voxel iteration bounds for this sphere
-                const float ceil_hack = 0.9999f;
+                const float max_grid_idx_float = static_cast<float>(grid_width - 1);
                 const uint16_t min_x = static_cast<uint16_t>(std::max(0.0f, (grid_center_x_float - grid_query_radius)));
-                const uint16_t max_x = static_cast<uint16_t>(std::min(static_cast<float>(grid_width - 1), (grid_center_x_float + grid_query_radius + ceil_hack)));
+                const uint16_t max_x = static_cast<uint16_t>(std::min(max_grid_idx_float, (grid_center_x_float + grid_query_radius)));
                 const uint16_t min_y = static_cast<uint16_t>(std::max(0.0f, (grid_center_y_float - grid_query_radius)));
-                const uint16_t max_y = static_cast<uint16_t>(std::min(static_cast<float>(grid_width - 1), (grid_center_y_float + grid_query_radius + ceil_hack)));
+                const uint16_t max_y = static_cast<uint16_t>(std::min(max_grid_idx_float, (grid_center_y_float + grid_query_radius)));
                 const uint16_t min_z = static_cast<uint16_t>(std::max(0.0f, (grid_center_z_float - grid_query_radius)));
-                const uint16_t max_z = static_cast<uint16_t>(std::min(static_cast<float>(grid_width - 1), (grid_center_z_float + grid_query_radius + ceil_hack)));
+                const uint16_t max_z = static_cast<uint16_t>(std::min(max_grid_idx_float, (grid_center_z_float + grid_query_radius)));
 
                 // Traverse spatial hierarchy for this sphere
                 for (uint16_t voxel_x = min_x; voxel_x <= max_x; ++voxel_x) {
@@ -455,19 +469,14 @@ namespace vamp::collision
 
         void configure_grid() {
             const float workspace_width = workspace_aabb_max[0] - workspace_aabb_min[0];
+            voxel_size = (max_query_radius) + point_radius;
             
             grid_width = static_cast<uint16_t>(std::min(
-                static_cast<uint32_t>(std::floor(workspace_width / (max_query_radius + point_radius))), // Empirically < 100 for manipulator robots
+                static_cast<uint32_t>(std::floor(workspace_width / voxel_size)), // Empirically < 100 for manipulator robots
                 static_cast<uint32_t>(MAX_GRID_WIDTH) // upper bound
             ));
 
             inverse_scale_factor = grid_width / workspace_width;
-        }
-
-        void initialize_memory_pools() {    
-            initialize_point_coord_pool();
-            initialize_hierarchy_pool();
-            initialize_voxel_storage();
         }
 
         void initialize_point_coord_pool() {
@@ -514,7 +523,7 @@ namespace vamp::collision
             table_array_len = grid_width;
 
             // 2. Estimate Voxel Index Table requirements (Z level)
-            const size_t estimated_z_tables = static_cast<size_t>(grid_width) * grid_width * 0.5;
+            const size_t estimated_z_tables = static_cast<size_t>(grid_width) * grid_width * 0.8;
             const size_t z_table_pool_bytes = estimated_z_tables * grid_width * sizeof(VoxelIndex);
             z_table_array_len = grid_width;
 
@@ -610,6 +619,84 @@ namespace vamp::collision
                 voxel_storage[voxel_index].add_point(point, point_radius);
             }
         }
+        
+        void build_spatial_grid_two_phase(const std::vector<Point>& points) {
+            // --- PHASE 1: INIT HIERARCHY &  ---
+            
+            // Initialize root of three-level table hierarchy
+            TableOffset x_table_offset;
+            x_level_table = allocate_table<XLevelTable>(x_table_offset);
+
+            // Keep track of which voxel each point belongs to so we don't re-calculate in Phase 2
+            std::vector<VoxelIndex> point_to_voxel(points.size());
+            
+            // Insert each point into the corresponding voxel
+            for (size_t i = 0; i < points.size(); ++i) {
+                const auto& point = points[i];
+                // Transform point coordinates to grid space
+                const float voxel_x_float = (point[0] - workspace_aabb_min[0]) * inverse_scale_factor;
+                const float voxel_y_float = (point[1] - workspace_aabb_min[1]) * inverse_scale_factor;
+                const float voxel_z_float = (point[2] - workspace_aabb_min[2]) * inverse_scale_factor;
+
+                // Clamp to valid grid indices just in case
+                const uint16_t voxel_x = static_cast<uint16_t>(std::clamp(voxel_x_float, 0.0f, static_cast<float>(grid_width - 1)));
+                const uint16_t voxel_y = static_cast<uint16_t>(std::clamp(voxel_y_float, 0.0f, static_cast<float>(grid_width - 1)));
+                const uint16_t voxel_z = static_cast<uint16_t>(std::clamp(voxel_z_float, 0.0f, static_cast<float>(grid_width - 1)));
+                // Intervals are half-open [lower, upper) except for the last voxel
+
+                // Level 1: Get Y-level
+                TableOffset y_offset = x_level_table[voxel_x];
+                if (y_offset == NULL_OFFSET) {
+                    allocate_table<YLevelTable>(x_level_table[voxel_x]);
+                }
+                YLevelTable y_level_table = reinterpret_cast<YLevelTable>(hierarchy_pool.get() + x_level_table[voxel_x]);
+
+                // Level 2: Get Z-level
+                TableOffset z_offset = y_level_table[voxel_y];
+                if (z_offset == NULL_OFFSET) {
+                    allocate_table<ZLevelTable>(y_level_table[voxel_y]);
+                }
+                ZLevelTable z_level_table = reinterpret_cast<ZLevelTable>(hierarchy_pool.get() + y_level_table[voxel_y]);
+                
+                // Level 3: Get or create voxel
+                VoxelIndex voxel_index = z_level_table[voxel_z];
+                if (voxel_index == INVALID_VOXEL_INDEX) {
+                    // Create new voxel and assign index
+                    voxel_index = static_cast<VoxelIndex>(voxel_storage.size());
+                    voxel_storage.emplace_back();
+                    z_level_table[voxel_z] = voxel_index;
+                }
+                voxel_storage[voxel_index].point_count++; // Increment count only
+                point_to_voxel[i] = voxel_index;          // Cache index
+            }
+                
+
+            // --- PHASE 2: EXACT ALLOCATION & FILLING ---
+            size_t total_required_floats = 0;
+            constexpr size_t SIMD_WIDTH = FVectorT::num_scalars;
+
+            for (auto& voxel : voxel_storage) {
+                // Round each voxel's count up to SIMD width for alignment
+                voxel.capacity = (voxel.point_count + SIMD_WIDTH - 1) & ~(SIMD_WIDTH - 1);
+                total_required_floats += voxel.capacity * 3; // X, Y, Z
+            }
+            // Now call a modified version of initialize_point_coord_pool(total_required_floats)
+            allocate_exact_point_pool(total_required_floats);
+
+            // Assign pointers within the pool
+            for (auto& voxel : voxel_storage) {
+                voxel.x_coords = allocate_coords(voxel.capacity);
+                voxel.y_coords = allocate_coords(voxel.capacity);
+                voxel.z_coords = allocate_coords(voxel.capacity);
+                // Reset count to 0 so add_point() can fill it correctly
+                voxel.point_count = 0; 
+            }
+
+            for (size_t i = 0; i < points.size(); ++i) {
+                VoxelIndex voxel_index = point_to_voxel[i];
+                voxel_storage[voxel_index].add_point(points[i], point_radius);
+            }
+        }
 
         void compute_global_bounds() {
             initialize_empty_bounds();
@@ -630,13 +717,30 @@ namespace vamp::collision
         // MEMORY POOL ALLOCATION
         // ====================================================================
         
+        void allocate_exact_point_pool(size_t total_floats) {
+            point_coord_pool_size = total_floats;
+            size_t total_bytes = point_coord_pool_size * sizeof(float);
+            
+            void* raw_ptr = nullptr;
+            if (posix_memalign(&raw_ptr, 64, total_bytes) != 0) {
+                throw std::runtime_error("Failed to allocate exact pool");
+            }
+            
+            point_coord_pool.reset(static_cast<float*>(raw_ptr));
+            point_coord_pool_used = 0;
+            
+            // Optional: Fill with Infinity for SIMD safety padding
+            std::fill(point_coord_pool.get(), point_coord_pool.get() + point_coord_pool_size, 
+                      std::numeric_limits<float>::infinity());
+        }
+
         template<typename T>
         T allocate_table(TableOffset& out_offset) {
             const size_t element_size = std::is_same_v<T, ZLevelTable> ? sizeof(VoxelIndex) : sizeof(TableOffset);
             const size_t size_bytes = grid_width * element_size;
             
             if (hierarchy_pool_used_bytes + size_bytes > hierarchy_pool_size_bytes) {
-                std::cout << "try to allocate " << size_bytes << "bytes. Capacity: " << hierarchy_pool_size_bytes << "bytes" << std::endl;
+                std::cout << "try to allocate " << hierarchy_pool_used_bytes + size_bytes << " bytes. Capacity: " << hierarchy_pool_size_bytes << "bytes" << std::endl;
                 throw std::runtime_error("hierarchy pool exhausted");
             }
             
@@ -659,7 +763,6 @@ namespace vamp::collision
             }
             
             float* result = point_coord_pool.get() + point_coord_pool_used;
-            std::fill(result, result + count, std::numeric_limits<float>::infinity());
             point_coord_pool_used += count;
             return result;
         }
@@ -751,13 +854,13 @@ namespace vamp::collision
             
             if (std::abs(max_query_radius - 0.07999999821186066) < eps &&
                 std::abs(min_query_radius - 0.014999999664723873) < eps) {
-                return "UR5";
+                return "ur5";
             } else if (std::abs(max_query_radius - 0.07999999821186066) < eps && 
             std::abs(min_query_radius - 0.012000000104308128) < eps) {
-                return "Panda";
+                return "panda";
             } else if (std::abs(max_query_radius - 0.23999999463558197) < eps &&
                        std::abs(min_query_radius - 0.012000000104308128) < eps) {
-                return "Fetch";
+                return "fetch";
             }
             return "UnknownRobot";
         }
@@ -863,6 +966,224 @@ namespace vamp::collision
             }
         
             out.close();
+        }
+
+        struct QueryData {
+            std::vector<std::vector<float>> x_coords;
+            std::vector<std::vector<float>> y_coords;
+            std::vector<std::vector<float>> z_coords;
+            std::vector<std::vector<float>> radii;
+        };
+        
+        // Parse query data from text file
+        bool loadQueries(const std::string& filename, QueryData& queries) {
+            std::ifstream file(filename);
+            if (!file.is_open()) {
+                std::cerr << "Error: Cannot open query file: " << filename << std::endl;
+                return false;
+            }
+        
+            queries.x_coords.clear();
+            queries.y_coords.clear();
+            queries.z_coords.clear();
+            queries.radii.clear();
+        
+            std::string line;
+            while (std::getline(file, line)) {
+                // Parse line format: [ [x values] ] [ [y values] ] [ [z values] ] [ [radii] ]
+                std::vector<std::vector<float>> line_data(4);
+                
+                std::istringstream iss(line);
+                std::string token;
+                int array_idx = 0;
+                
+                while (iss >> token && array_idx < 4) {
+                    if (token == "[") {
+                        // Skip opening bracket
+                        continue;
+                    } else if (token == "]") {
+                        array_idx++;
+                        continue;
+                    } else if (token.front() == '[' && token.back() != ']') {
+                        // Start of array, remove opening bracket
+                        token = token.substr(1);
+                    }
+                    
+                    // Clean up token (remove commas, brackets)
+                    token.erase(std::remove(token.begin(), token.end(), ','), token.end());
+                    if (token.back() == ']') {
+                        token.pop_back();
+                    }
+                    
+                    if (!token.empty()) {
+                        try {
+                            float value = std::stof(token);
+                            line_data[array_idx].push_back(value);
+                        } catch (const std::exception& e) {
+                            // Skip invalid tokens
+                        }
+                    }
+                }
+                
+                if (!line_data[0].empty()) {
+                    queries.x_coords.push_back(line_data[0]);
+                    queries.y_coords.push_back(line_data[1]);
+                    queries.z_coords.push_back(line_data[2]);
+                    queries.radii.push_back(line_data[3]);
+                }
+            }
+            
+            file.close();
+            // std::cout << "Loaded " << queries.x_coords.size() << " query sets from " << filename << std::endl;
+            return true;
+        }
+        
+        void benchmark_collision_queries(const std::string& query_file) noexcept {
+            // Load query data from file
+            QueryData queries;
+            if (!loadQueries(query_file, queries)) {
+                std::cerr << "Failed to load queries from: " << query_file << std::endl;
+                return;
+            }
+            
+            if (queries.x_coords.empty()) {
+                std::cerr << "No valid queries loaded from file" << std::endl;
+                return;
+            }
+            
+            // Validate that all coordinate arrays have the same size
+            const size_t num_batches = queries.x_coords.size();
+            std::cout << "num_batches = " << num_batches << std::endl;
+            if (queries.y_coords.size() != num_batches || 
+                queries.z_coords.size() != num_batches || 
+                queries.radii.size() != num_batches) {
+                std::cerr << "Error: Inconsistent batch sizes in query data" << std::endl;
+                return;
+            }
+            
+            // Flatten all queries into single vectors
+            std::vector<float> all_x_coords;
+            std::vector<float> all_y_coords;
+            std::vector<float> all_z_coords;
+            std::vector<float> all_radii;
+            
+            for (size_t batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
+                const auto& x_batch = queries.x_coords[batch_idx];
+                const auto& y_batch = queries.y_coords[batch_idx];
+                const auto& z_batch = queries.z_coords[batch_idx];
+                const auto& r_batch = queries.radii[batch_idx];
+                
+                // Validate batch consistency
+                const size_t batch_size = x_batch.size();
+                if (y_batch.size() != batch_size || 
+                    z_batch.size() != batch_size || 
+                    r_batch.size() != batch_size) {
+                    std::cerr << "Warning: Inconsistent sizes in batch " << batch_idx << ", skipping..." << std::endl;
+                    continue;
+                }
+                
+                // Append individual queries to flattened vectors
+                all_x_coords.insert(all_x_coords.end(), x_batch.begin(), x_batch.end());
+                all_y_coords.insert(all_y_coords.end(), y_batch.begin(), y_batch.end());
+                all_z_coords.insert(all_z_coords.end(), z_batch.begin(), z_batch.end());
+                all_radii.insert(all_radii.end(), r_batch.begin(), r_batch.end());
+            }
+            
+            const size_t total_individual_queries = all_x_coords.size();
+            if (total_individual_queries == 0) {
+                std::cerr << "No valid individual queries found" << std::endl;
+                return;
+            }
+            
+            std::cout << "Starting collision query benchmark with " << total_individual_queries << " individual queries..." << std::endl;
+            
+            size_t total_queries = 0;
+            size_t total_collisions = 0;
+            
+            // Determine SIMD vector size
+            constexpr size_t SIMD_WIDTH = FVectorT::num_scalars;
+
+            // Start timing
+            auto start_time = std::chrono::steady_clock::now();
+        
+            // Process individual queries in SIMD-sized batches
+            for (size_t i = 0; i < total_individual_queries; i += SIMD_WIDTH) {
+                const size_t remaining = std::min(SIMD_WIDTH, total_individual_queries - i);
+                
+                // Prepare SIMD vectors for centers (SoA format) and radii
+                std::array<FVectorT, 3> centers;
+                FVectorT radii;
+                
+                // Load data into SIMD vectors in SoA format
+                for (size_t j = 0; j < remaining; ++j) {
+                    centers[0][j] = all_x_coords[i + j];  // X coordinates
+                    centers[1][j] = all_y_coords[i + j];  // Y coordinates  
+                    centers[2][j] = all_z_coords[i + j];  // Z coordinates
+                    radii[j] = all_radii[i + j];          // Radii
+                }
+                
+                // Perform SIMD collision detection
+                bool collision_result = collides_simd(centers, radii);
+                
+                // Count collisions
+                if (collision_result) {
+                    total_collisions++;
+                }
+                
+                total_queries += remaining;
+            }
+            
+            // End timing
+            auto end_time = std::chrono::steady_clock::now();
+            auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time);
+            
+            // Output benchmark results
+            std::cout << "=== Collision Query Benchmark Results ===" << std::endl;
+            std::cout << "Total batches processed: " << num_batches << std::endl;
+            std::cout << "Total queries processed: " << total_queries << std::endl;
+            std::cout << "Total collisions detected: " << total_collisions << std::endl;
+            std::cout << "Total execution time: " << duration.count() << " nanoseconds" << std::endl;
+            std::cout << "Average time per query: " << (total_queries > 0 ? duration.count() / total_queries : 0) << " nanoseconds" << std::endl;
+
+            std::cout << "Collision rate: " << (total_queries > 0 ? (100.0 * total_collisions) / total_queries : 0) << "%" << std::endl;
+        
+            // Log to file
+            std::ofstream log_file("scripts/log/benchmark_results.txt", std::ios::app);
+            if (log_file.is_open()) {
+                std::cout << "log_file is open" << std::endl;
+                log_file << "=== MVT Collision Checking Benchamrk ===" << std::endl
+                        << "Batches: " << num_batches << ", Queries: " << total_queries 
+                        << ", Collisions: " << total_collisions 
+                        << ", Time: " << duration.count() << " nanoseconds"
+                        << ", Avg: " << (total_queries > 0 ? duration.count() / total_queries : 0) << " nanoseconds" 
+                        << std::endl;
+                log_file.close();
+            }
+        }
+
+        void print_simd_args(const std::array<FVectorT, 3>& centers, 
+                             FVectorT radii) const noexcept {
+            constexpr size_t SIMD_WIDTH = FVectorT::num_scalars;
+            alignas(32) float x[SIMD_WIDTH], y[SIMD_WIDTH], z[SIMD_WIDTH], r[SIMD_WIDTH];
+        
+            std::memcpy(x, &centers[0], sizeof(FVectorT));
+            std::memcpy(y, &centers[1], sizeof(FVectorT));
+            std::memcpy(z, &centers[2], sizeof(FVectorT));
+            std::memcpy(r, &radii,      sizeof(FVectorT));
+        
+            auto print_lane = [](const float* data) {
+                std::cout << "[ ";
+                for (int i = 0; i < SIMD_WIDTH; ++i) {
+                    std::cout << data[i] << (i == SIMD_WIDTH - 1 ? "" : " ");
+                }
+                std::cout << " ] ";
+            };
+        
+            print_lane(x);
+            print_lane(y);
+            print_lane(z);
+            print_lane(r);
+            std::cout << std::endl;
         }
 
     };
