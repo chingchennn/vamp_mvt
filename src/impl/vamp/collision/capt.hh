@@ -17,6 +17,9 @@
 #include <vamp/collision/math.hh>
 #include <vamp/vector.hh>
 
+// #define RECORD_MEM
+// #define BENCHMARK_CC
+
 namespace vamp::collision
 {
 
@@ -365,9 +368,13 @@ namespace vamp::collision
                       std::numeric_limits<float>::infinity(),
                       std::numeric_limits<float>::infinity()}},
                     0u});
-
-            // benchmark_collision_queries("../cc_queries_capt.txt");
-            // record_capt_state_to_file("scripts/log/");
+#ifdef BENCHMARK_CC
+            benchmark_collision_queries("../nanoflann_dataset/cage_fetch_capt_q/60/collide.txt");
+            benchmark_collision_queries("../nanoflann_dataset/cage_fetch_capt_q/60/safe.txt");
+#endif
+#ifdef RECORD_MEM
+            record_capt_state_to_file("scripts/log/");
+#endif
         }
 
         //  Test whether a sphere centered at `center` with radius-squared `radius_sq` collides with any
@@ -632,7 +639,6 @@ namespace vamp::collision
             std::vector<std::vector<float>> radii;
         };
         
-        // Parse query data from text file
         bool loadQueries(const std::string& filename, QueryData& queries) {
             std::ifstream file(filename);
             if (!file.is_open()) {
@@ -730,7 +736,6 @@ namespace vamp::collision
                 const auto& z_batch = queries.z_coords[batch_idx];
                 const auto& r_batch = queries.radii[batch_idx];
                 
-                // Validate batch consistency
                 const size_t batch_size = x_batch.size();
                 if (y_batch.size() != batch_size || 
                     z_batch.size() != batch_size || 
@@ -739,7 +744,6 @@ namespace vamp::collision
                     continue;
                 }
                 
-                // Append individual queries to flattened vectors
                 all_x_coords.insert(all_x_coords.end(), x_batch.begin(), x_batch.end());
                 all_y_coords.insert(all_y_coords.end(), y_batch.begin(), y_batch.end());
                 all_z_coords.insert(all_z_coords.end(), z_batch.begin(), z_batch.end());
@@ -754,69 +758,118 @@ namespace vamp::collision
             
             std::cout << "Starting collision query benchmark with " << total_individual_queries << " individual queries..." << std::endl;
             
-            size_t total_queries = 0;
-            size_t total_collisions = 0;
-            
-            // Determine SIMD vector size
             constexpr size_t SIMD_WIDTH = 4;
+            constexpr int NUM_TRIALS = 10;
             
-            // Start timing
-            auto start_time = std::chrono::steady_clock::now();
-        
-            // Process individual queries in SIMD-sized batches
-            for (size_t i = 0; i < total_individual_queries; i += SIMD_WIDTH) {
-                const size_t remaining = std::min(SIMD_WIDTH, total_individual_queries - i);
+            std::vector<double> simd_total_times(NUM_TRIALS, 0.0);
+            std::vector<double> scalar_total_times(NUM_TRIALS, 0.0);
+            
+            size_t final_collisions_simd = 0;
+            size_t final_collisions_scalar = 0;
+
+            // 1. Benchmark: SIMD Version (10 Trials)
+            for (int trial = 0; trial < NUM_TRIALS; ++trial) {
+                size_t current_collisions = 0;
                 
-                // Prepare SIMD vectors for centers (SoA format) and radii
-                std::array<FVectorT, 3> centers;
-                FVectorT radii;
+                auto start_time = std::chrono::steady_clock::now();
                 
-                // Load data into SIMD vectors in SoA format
-                for (size_t j = 0; j < remaining; ++j) {
-                    centers[0][j] = all_x_coords[i + j];  // X coordinates
-                    centers[1][j] = all_y_coords[i + j];  // Y coordinates  
-                    centers[2][j] = all_z_coords[i + j];  // Z coordinates
-                    radii[j] = all_radii[i + j];          // Radii
+                for (size_t i = 0; i < total_individual_queries; i += SIMD_WIDTH) {
+                    const size_t remaining = std::min(SIMD_WIDTH, total_individual_queries - i);
+                    std::array<FVectorT, 3> centers;
+                    FVectorT radii;
+                    
+                    for (size_t j = 0; j < remaining; ++j) {
+                        centers[0][j] = all_x_coords[i];
+                        centers[1][j] = all_y_coords[i];
+                        centers[2][j] = all_z_coords[i];
+                        radii[j] = all_radii[i];
+                    }
+                    
+                    if (collides_simd(centers, radii)) {
+                        // std::cout << "SIMD Collide!!!" << std::endl;
+                        current_collisions++;
+                    }
                 }
                 
-                // Perform SIMD collision detection
-                bool collision_result = collides_simd(centers, radii);
+                auto end_time = std::chrono::steady_clock::now();
+                simd_total_times[trial] = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
+                final_collisions_simd = current_collisions;
+            }
+
+            // 2. Benchmark: Scalar Version (10 Trials)
+            for (int trial = 0; trial < NUM_TRIALS; ++trial) {
+                size_t current_collisions = 0;
                 
-                // Count collisions
-                if (collision_result) {
-                    total_collisions++;
+                auto start_time = std::chrono::steady_clock::now();
+                size_t batch_size = 4;
+                for (size_t i = 0; i < total_individual_queries; i += batch_size) {
+                    
+                    // Process i to i + 3
+                    for (size_t j = 0; j < batch_size && (i + j) < total_individual_queries; ++j) {
+                        size_t idx = i + j;
+                        
+                        Point center{all_x_coords[idx], all_y_coords[idx], all_z_coords[idx]};
+                        
+                        if (collides(center, all_radii[idx])) {
+                            current_collisions++; 
+                            // Collide --> Skip this batch
+                            break; 
+                        }
+                    }
                 }
-                
-                total_queries += remaining;
+                auto end_time = std::chrono::steady_clock::now();
+                scalar_total_times[trial] = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
+                final_collisions_scalar = current_collisions;
+            }
+
+            // 3. Statistics
+            double simd_sum = 0.0, scalar_sum = 0.0;
+            for (int i = 0; i < NUM_TRIALS; ++i) {
+                simd_sum += simd_total_times[i];
+                scalar_sum += scalar_total_times[i];
             }
             
-            // End timing
-            auto end_time = std::chrono::steady_clock::now();
-            auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time);
+            double simd_avg_total = simd_sum / NUM_TRIALS;
+            double simd_avg_per_query = simd_avg_total / total_individual_queries;
             
-            // Output benchmark results
-            std::cout << "=== Collision Query Benchmark Results ===" << std::endl;
-            std::cout << "Total batches processed: " << num_batches << std::endl;
-            std::cout << "Total queries processed: " << total_queries << std::endl;
-            std::cout << "Total collisions detected: " << total_collisions << std::endl;
-            std::cout << "Total execution time: " << duration.count() << " nanoseconds" << std::endl;
-            std::cout << "Average time per query: " << (total_queries > 0 ? duration.count() / total_queries : 0) << " nanoseconds" << std::endl;
+            double scalar_avg_total = scalar_sum / NUM_TRIALS;
+            double scalar_avg_per_query = scalar_avg_total / total_individual_queries;
 
-            std::cout << "Collision rate: " << (total_queries > 0 ? (100.0 * total_collisions) / total_queries : 0) << "%" << std::endl;
-        
-            // Log to file
-            std::ofstream log_file("scripts/log/benchmark_results.txt", std::ios::app);
+            // 4. Write to log
+            std::ofstream log_file("scripts/log/cage_60_fetch_capt_q_capt_rlt.txt", std::ios::app);
             if (log_file.is_open()) {
-                std::cout << "log_file is open" << std::endl;
-                log_file << "=== CAPT Collision Checking Benchamrk ===" << std::endl
-                        << "Batches: " << num_batches << ", Queries: " << total_queries 
-                        << ", Collisions: " << total_collisions 
-                        << ", Time: " << duration.count() << " nanoseconds"
-                        << ", Avg: " << (total_queries > 0 ? duration.count() / total_queries : 0) << " nanoseconds" 
-                        << std::endl;
+                log_file << "====================================================\n";
+                log_file << "File: " << query_file << "\n";
+                log_file << "Total individual queries: " << total_individual_queries << "\n";
+                log_file << "Trials per method: " << NUM_TRIALS << "\n\n";
+
+                // SIMD result
+                log_file << "[SIMD Version] Collisions: " << final_collisions_simd << "\n";
+                log_file << "10 Trials Total Time (ns): ";
+                for (int i = 0; i < NUM_TRIALS; ++i) log_file << simd_total_times[i] << (i == NUM_TRIALS-1 ? "" : ", ");
+                log_file << "\n";
+                log_file << "Avg Total Time:     " << simd_avg_total << " ns\n";
+                log_file << "Avg Time per Query: " << simd_avg_per_query << " ns\n\n";
+
+                // Scalar result
+                log_file << "[Scalar Version] Collisions: " << final_collisions_scalar << "\n";
+                log_file << "10 Trials Total Time (ns): ";
+                for (int i = 0; i < NUM_TRIALS; ++i) log_file << scalar_total_times[i] << (i == NUM_TRIALS-1 ? "" : ", ");
+                log_file << "\n";
+                log_file << "Avg Total Time:     " << scalar_avg_total << " ns\n";
+                log_file << "Avg Time per Query: " << scalar_avg_per_query << " ns\n\n";
+
+                // Summary
+                log_file << "Speedup (Scalar Avg / SIMD Avg): " << (scalar_avg_per_query / simd_avg_per_query) << "x\n";
+                log_file << "====================================================\n";
+                
                 log_file.close();
+                std::cout << "Benchmark completed successfully. Log saved." << std::endl;
+            } else {
+                std::cerr << "Error: Could not open log file." << std::endl;
             }
         }
+
         void record_capt_state_to_file(const std::string& folder_path) const {
             // 1. Identify Robot (using logic similar to your baseline)
             auto get_robot_name = [&]() -> std::string {
